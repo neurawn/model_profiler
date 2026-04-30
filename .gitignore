@@ -1,0 +1,7 @@
+model/
+__pycache__/
+*.pyc
+.DS_Store
+profiling_results/
+small
+medium
