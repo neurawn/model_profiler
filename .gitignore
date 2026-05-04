@@ -5,3 +5,5 @@ __pycache__/
 profiling_results/
 small
 medium
+merged_models/
+*.pt

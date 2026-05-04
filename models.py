@@ -128,130 +128,24 @@ def vit_input_fn(batch_size: int) -> torch.Tensor:
 
 
 # ════════════════════════════════════════════════════════════════
-# 4. BLACKBOX MODEL WRAPPER
-# ════════════════════════════════════════════════════════════════
-
-class BlackboxModel(nn.Module):
-    """
-    Wraps any nn.Module to simulate a "blackbox" scenario.
-    The profiler should work without knowing the original architecture.
-
-    This demonstrates that the framework can analyze unknown models
-    by examining the parameter structure and runtime behavior.
-    """
-
-    def __init__(self, model: nn.Module, name: str = "blackbox"):
-        super().__init__()
-        self.wrapped = model
-        self._name = name
-        # Deliberately hide the class name
-        self.__class__.__name__ = "BlackboxModel"
-
-    def forward(self, *args, **kwargs):
-        return self.wrapped(*args, **kwargs)
-
-    @property
-    def name(self):
-        return self._name
-
-
-def load_blackbox_model(model: Optional[nn.Module] = None,
-                        sample_input: Optional[torch.Tensor] = None,
-                        forward_fn: Optional[Callable] = None,
-                        name: str = "blackbox") -> Tuple[nn.Module, torch.Tensor, Optional[Callable]]:
-    """
-    Wrap an existing model as a blackbox, or create a custom unknown model.
-
-    If no model is provided, creates a moderately complex custom architecture
-    that mixes different layer types — the framework should still be able
-    to profile and recommend compression for it.
-    """
-    if model is not None:
-        print(f"  Wrapping existing model as blackbox...")
-        wrapped = BlackboxModel(model, name=name)
-        if sample_input is None:
-            sample_input = torch.randn(1, 3, 224, 224)  # default
-        return wrapped, sample_input, forward_fn
-
-    # Create a custom "unknown" architecture
-    print("  Creating custom blackbox model...")
-
-    class CustomUnknownNet(nn.Module):
-        """
-        A deliberate mix of conv, attention-like, and linear layers.
-        The profiler should handle this without prior knowledge.
-        """
-        def __init__(self):
-            super().__init__()
-            # Conv backbone
-            self.features = nn.Sequential(
-                nn.Conv2d(3, 64, 3, padding=1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Conv2d(64, 128, 3, padding=1),
-                nn.BatchNorm2d(128),
-                nn.ReLU(),
-                nn.MaxPool2d(2),
-                nn.Conv2d(128, 256, 3, padding=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((7, 7)),
-            )
-            # Linear head with a pseudo-attention mechanism
-            self.flatten = nn.Flatten()
-            self.fc1 = nn.Linear(256 * 7 * 7, 512)
-            self.query = nn.Linear(512, 128)
-            self.key = nn.Linear(512, 128)
-            self.value = nn.Linear(512, 128)
-            self.out_proj = nn.Linear(128, 256)
-            self.classifier = nn.Linear(256, 10)
-            self.dropout = nn.Dropout(0.3)
-
-        def forward(self, x):
-            x = self.features(x)
-            x = self.flatten(x)
-            x = torch.relu(self.fc1(x))
-
-            # Simple self-attention-like operation
-            q = self.query(x)
-            k = self.key(x)
-            v = self.value(x)
-            attn = torch.softmax(q * k / (128 ** 0.5), dim=-1)
-            x = attn * v
-            x = self.out_proj(x)
-            x = self.dropout(x)
-            return self.classifier(x)
-
-    model = BlackboxModel(CustomUnknownNet(), name="custom_blackbox")
-    sample_input = torch.randn(1, 3, 224, 224)
-
-    print(f"  ✓ Blackbox model created ({sum(p.numel() for p in model.parameters()):,} params)")
-    return model, sample_input, None
-
-
-# ════════════════════════════════════════════════════════════════
 # UTILITY: Load all models
 # ════════════════════════════════════════════════════════════════
 
 def load_all_models() -> dict:
     """
-    Load all four model types and return a dict of:
+    Load all three model types and return a dict of:
     {name: (model, sample_input, forward_fn)}
     """
     models = {}
 
-    print("\n[1/4] Loading Transformer (GPT-2)...")
+    print("\n[1/3] Loading Transformer (GPT-2)...")
     models["GPT-2"] = load_gpt2()
 
-    print("\n[2/4] Loading CNN (ResNet-18)...")
+    print("\n[2/3] Loading CNN (ResNet-18)...")
     models["ResNet-18"] = load_resnet18()
 
-    print("\n[3/4] Loading ViT (Vision Transformer)...")
+    print("\n[3/3] Loading ViT (Vision Transformer)...")
     models["ViT-Base"] = load_vit()
 
-    print("\n[4/4] Loading Blackbox Model...")
-    models["Blackbox"] = load_blackbox_model()
-
-    print("\n✓ All models loaded.\n")
+    print("\n All models loaded.\n")
     return models

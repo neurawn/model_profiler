@@ -4,15 +4,13 @@ Main Pipeline
 Orchestrates the full profiling and recommendation pipeline across all models:
 1. Load models (GPT-2, ResNet-18, ViT, Blackbox)
 2. Run static profiling on each
-3. Run dynamic profiling on each
-4. Generate compression recommendations
-5. Compare results and validate hypotheses
+3. Generate compression recommendations
+4. Compare results and validate hypotheses
 
 Usage:
     python main.py                  # Profile all models
     python main.py --model gpt2     # Profile only GPT-2
-    python main.py --static-only    # Skip dynamic profiling
-    python main.py --device cuda    # Use GPU for dynamic profiling
+    python main.py --graph-export   # Run graph export analysis
 """
 
 import sys
@@ -21,6 +19,7 @@ import json
 import time
 import argparse
 import torch
+import torch.nn as nn
 
 # Add current dir to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,18 +30,21 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 os.environ["HF_HOME"] = MODEL_DIR
 
 from static_profiler import StaticProfiler
-from dynamic_profiler import DynamicProfiler
 from compression_recommender import CompressionRecommender, recommend_for_model
 from models import (
-    load_gpt2, load_resnet18, load_vit, load_blackbox_model, load_all_models,
+    load_gpt2, load_resnet18, load_vit,
     gpt2_input_fn, resnet_input_fn, vit_input_fn,
 )
+from token_merging import (
+    compare_strategies, apply_token_merging, TokenMergingProfiler,
+)
+from quantize import quantize_model
+from graph_export import run_graph_export, _export_model as export_single_model
 
 
 def profile_single_model(model_name, model, sample_input, forward_fn,
-                          static_profiler, dynamic_profiler,
-                          run_dynamic=True, target_device="gpu"):
-    """Run full profiling pipeline on a single model."""
+                          static_profiler, target_device="gpu"):
+    """Run static profiling pipeline on a single model."""
     print(f"\n{'#'*70}")
     print(f"#  PROFILING: {model_name}")
     print(f"{'#'*70}")
@@ -55,33 +57,134 @@ def profile_single_model(model_name, model, sample_input, forward_fn,
     print(f"  Completed in {static_time:.2f}s")
     print(static_profile.summary())
 
-    # ── Dynamic Profiling ──
-    dynamic_profile = None
-    if run_dynamic:
-        print(f"[Dynamic Profiling] Benchmarking {model_name} at runtime...")
-        t0 = time.time()
-        dynamic_profile = dynamic_profiler.profile(
-            model, sample_input,
-            model_name=model_name,
-            forward_fn=forward_fn,
-        )
-        dynamic_time = time.time() - t0
-        print(f"  Completed in {dynamic_time:.2f}s")
-        print(dynamic_profile.summary())
-
-    # # ── Compression Recommendation ──
-    # print(f"[Recommendations] Generating compression advice for {model_name}...")
-    # report = recommend_for_model(
-    #     static_profile, dynamic_profile,
-    #     target_device=target_device,
-    #     verbose=True,
-    # )
-
     return {
         "static": static_profile,
-        "dynamic": dynamic_profile,
-        # "recommendation": report,
     }
+
+
+def analyze_token_merging(model, sample_input, forward_fn, model_name,
+                          ratios=None,
+                          save_merged=False, save_strategy="bipartite",
+                          save_ratio=0.5, output_dir="./profiling_results"):
+    """
+    Run token merging analysis on a ViT model and estimate theoretical speedup.
+
+    Compares all three strategies (bipartite, kmeans, average_pool) and
+    computes theoretical FLOPs/latency reduction based on token count reduction.
+    """
+    if ratios is None:
+        ratios = [0.3, 0.5, 0.7, 0.9]
+
+    print(f"\n{'#'*70}")
+    print(f"#  TOKEN MERGING ANALYSIS: {model_name}")
+    print(f"{'#'*70}")
+
+    # ── 1. Extract intermediate tokens from the model ──
+    token_tensor = None
+
+    def capture_hook(module, input, output):
+        nonlocal token_tensor
+        if isinstance(output, tuple):
+            token_tensor = output[0].detach()
+        elif isinstance(output, torch.Tensor) and output.ndim == 3:
+            token_tensor = output.detach()
+
+    # Find the first transformer layer to hook
+    hook_handle = None
+    for name, module in model.named_modules():
+        module_name = type(module).__name__.lower()
+        if any(kw in module_name for kw in ["vitlayer", "gpt2block", "encoderlayer", "bertlayer"]):
+            hook_handle = module.register_forward_hook(capture_hook)
+            break
+
+    if hook_handle is None:
+        print("  Could not find transformer layers for token merging analysis.")
+        return None
+
+    # Run forward pass to capture tokens
+    model.eval()
+    with torch.no_grad():
+        if forward_fn:
+            forward_fn(model, sample_input)
+        else:
+            model(sample_input)
+    hook_handle.remove()
+
+    if token_tensor is None:
+        print("  Could not capture token embeddings.")
+        return None
+
+    B, T, D = token_tensor.shape
+    print(f"\n  Token sequence: B={B}, T={T}, D={D}")
+
+    # ── 2. Compare strategies at each ratio ──
+    results = {}
+    for ratio in ratios:
+        print(f"\n{'─'*60}")
+        print(f"  Keep ratio = {ratio:.0%} (merge {1 - ratio:.0%} of tokens)")
+        print(f"{'─'*60}")
+
+        profile = compare_strategies(
+            token_tensor, ratio=ratio,
+            model_name=f"{model_name} (ratio={ratio})",
+            verbose=True,
+        )
+
+        # ── 3. Theoretical speedup estimation ──
+        for strategy_name, merge_result in profile.results.items():
+            T_new = merge_result.merged_count
+            r = T_new / T  # reduction ratio
+
+            attn_speedup = 1.0 / (r ** 2) if r > 0 else 1.0
+            ffn_speedup = 1.0 / r if r > 0 else 1.0
+            overall_speedup = 1.0 / (0.4 * r**2 + 0.6 * r) if r > 0 else 1.0
+
+            print(f"\n  [{strategy_name.upper()}] Theoretical Speedup:")
+            print(f"    Tokens:           {T} -> {T_new}")
+            print(f"    Attention speedup: {attn_speedup:.2f}x  (O(T^2) reduction)")
+            print(f"    FFN speedup:       {ffn_speedup:.2f}x  (O(T) reduction)")
+            print(f"    Overall speedup:   {overall_speedup:.2f}x")
+
+        results[ratio] = profile
+
+    # ── 4. Save merged model if requested ──
+    if save_merged:
+        print(f"\n{'─'*60}")
+        print(f"  SAVING MERGED MODEL (ratio={save_ratio}, {save_strategy})")
+        print(f"{'─'*60}")
+        try:
+            merged_model = apply_token_merging(
+                model, strategy=save_strategy, ratio=save_ratio,
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
+            save_path = os.path.join(
+                output_dir,
+                f"{safe_name}_tome_{save_strategy}_r{save_ratio}.pt",
+            )
+            # Remove hooks before saving (closures can't be pickled)
+            merged_model.remove_hooks()
+            # Save the base model state dict + merging config
+            save_data = {
+                "model_state_dict": merged_model.model.state_dict(),
+                "model_class": type(merged_model.model).__name__,
+                "merge_config": {
+                    "strategy": save_strategy,
+                    "ratio": save_ratio,
+                    "protect_cls": merged_model.protect_cls,
+                    "merge_layers": merged_model.merge_layers,
+                },
+            }
+            torch.save(save_data, save_path)
+            print(f"    Saved merged model: {save_path}")
+            print(f"    Load with: data = torch.load('{save_path}')")
+            print(f"    Then:      model.load_state_dict(data['model_state_dict'])")
+            print(f"               wrapped = apply_token_merging(model, **data['merge_config'])")
+        except Exception as e:
+            print(f"    Could not save merged model: {e}")
+
+    print(f"\n{'#'*70}\n")
+    return results
 
 
 def compare_results(all_results):
@@ -101,37 +204,6 @@ def compare_results(all_results):
         sp = result["static"]
         print(f"  {name:20s}  uniformity = {sp.param_uniformity_score:.4f}")
 
-    # ── Hypothesis 2: Quantization recommended for Transformers ──
-    print("\n[Hypothesis 2] Top Recommended Method per Model")
-    print("  Proposal predicts: Transformer→Quantization, CNN→Pruning")
-    print("  ─────────────────────────────────────────────")
-    for name, result in all_results.items():
-        rec = result["recommendation"]
-        top = rec.top_recommendation
-        if top:
-            print(f"  {name:20s}  → {top.method.value:30s} (score={top.score:.3f})")
-            print(f"  {'':20s}    arch_class = {rec.inferred_architecture_class}")
-
-    # ── Hypothesis 3: ViT should get a mixed recommendation ──
-    print("\n[Hypothesis 3] ViT Recommendation Analysis")
-    if "ViT-Base" in all_results:
-        rec = all_results["ViT-Base"]["recommendation"]
-        print(f"  Architecture classified as: {rec.inferred_architecture_class}")
-        print(f"  Top 3 recommendations:")
-        for i, r in enumerate(rec.recommendations[:3]):
-            print(f"    {i+1}. {r.method.value:30s} score={r.score:.3f}")
-
-    # ── Architecture classification for blackbox ──
-    print("\n[Blackbox Analysis] Can we identify the unknown model?")
-    if "Blackbox" in all_results:
-        rec = all_results["Blackbox"]["recommendation"]
-        sp = all_results["Blackbox"]["static"]
-        print(f"  Inferred class:     {rec.inferred_architecture_class}")
-        print(f"  Has attention:      {sp.has_attention}")
-        print(f"  Has convolutions:   {sp.has_convolutions}")
-        print(f"  Uniformity:         {sp.param_uniformity_score:.4f}")
-        print(f"  Top recommendation: {rec.top_recommendation.method.value}")
-
     print(f"\n{'#'*70}\n")
 
 
@@ -143,15 +215,91 @@ def save_results(all_results, output_dir):
         safe_name = name.lower().replace(" ", "_").replace("-", "_")
         data = {
             "static_profile": result["static"].to_dict(),
-            # "recommendation": result["recommendation"].to_dict(),
         }
-        if result["dynamic"]:
-            data["dynamic_profile"] = result["dynamic"].to_dict()
+        if "graph_profile" in result:
+            data["graph_profile"] = result["graph_profile"].to_dict()
 
         path = os.path.join(output_dir, f"{safe_name}_profile.json")
         with open(path, "w") as f:
             json.dump(data, f, indent=2, default=str)
         print(f"  Saved: {path}")
+
+
+def _is_safetensors(path: str) -> bool:
+    """Check if a file is safetensors format by reading the header."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+        return b'{"__meta' in header or b'"__metadata__"' in header
+    except Exception:
+        return False
+
+
+def _load_arch_with_weights(arch: str, weight_path: str,
+                            state_dict: dict = None,
+                            is_safetensors: bool = False):
+    """
+    Instantiate a model architecture and load weights into it.
+
+    Returns (model, forward_fn).
+    """
+    forward_fn = None
+
+    # GPT-2 family
+    if arch in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
+        from transformers import GPT2LMHeadModel
+        print(f"  Architecture: GPT2LMHeadModel ({arch})")
+        model = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+        forward_fn = lambda m, x: m(x, labels=x)
+
+    # ViT family
+    elif "vit" in arch.lower():
+        from transformers import ViTForImageClassification
+        print(f"  Architecture: ViTForImageClassification ({arch})")
+        model = ViTForImageClassification.from_pretrained(arch, cache_dir=MODEL_DIR)
+        forward_fn = lambda m, x: m(pixel_values=x)
+
+    # ResNet
+    elif arch.lower() in ("resnet18", "resnet34", "resnet50", "resnet101", "resnet152"):
+        import torchvision.models as tv_models
+        print(f"  Architecture: {arch}")
+        model = getattr(tv_models, arch.lower())(weights=None)
+
+    else:
+        # Try as a HuggingFace model ID
+        try:
+            from transformers import AutoModel
+            print(f"  Architecture: AutoModel ({arch})")
+            model = AutoModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+        except Exception as e:
+            print(f"Error: unknown architecture '{arch}': {e}")
+            sys.exit(1)
+
+    # Load weights
+    if is_safetensors:
+        try:
+            from safetensors.torch import load_file
+            sd = load_file(weight_path)
+        except ImportError:
+            print("Error: safetensors package required. Install with: pip install safetensors")
+            sys.exit(1)
+    elif state_dict is not None:
+        sd = state_dict
+    else:
+        sd = None
+
+    if sd is not None:
+        # Try strict load first, fall back to non-strict
+        try:
+            model.load_state_dict(sd, strict=True)
+            print(f"  Loaded weights (strict)")
+        except RuntimeError:
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            print(f"  Loaded weights (non-strict): "
+                  f"{len(missing)} missing, {len(unexpected)} unexpected")
+
+    model.eval()
+    return model, forward_fn
 
 
 def main():
@@ -160,7 +308,7 @@ def main():
     )
     parser.add_argument("--model", type=str, default="all",
                         choices=["all", "gpt2", "gpt2-medium", "gpt2-large",
-                                 "resnet", "vit", "blackbox"],
+                                 "resnet", "vit"],
                         help="Which model to profile")
     parser.add_argument("--local", type=str, default=None,
                         help="Path to a local PyTorch model file (.pt/.pth). "
@@ -168,37 +316,81 @@ def main():
     parser.add_argument("--input-shape", type=str, default=None,
                         help="Input shape as comma-separated ints (e.g. '1,3,224,224'). "
                              "Used with --local. Defaults to 1,3,224,224.")
-    parser.add_argument("--static-only", action="store_true",
-                        help="Skip dynamic profiling")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device for dynamic profiling (cpu/cuda)")
+    parser.add_argument("--arch", type=str, default=None,
+                        help="Model architecture for loading state dicts or safetensors. "
+                             "e.g. 'gpt2', 'gpt2-medium', 'gpt2-large', "
+                             "'google/vit-base-patch16-224', 'resnet18'")
     parser.add_argument("--target-device", type=str, default="gpu",
                         choices=["gpu", "cpu", "mobile", "edge"],
                         help="Target deployment device for recommendations")
     parser.add_argument("--output-dir", type=str, default="./profiling_results",
                         help="Directory to save JSON results")
-    parser.add_argument("--warmup", type=int, default=3,
-                        help="Number of warmup runs for dynamic profiling")
-    parser.add_argument("--benchmark-runs", type=int, default=20,
-                        help="Number of benchmark runs for latency measurement")
+    parser.add_argument("--token-merging", action="store_true",
+                        help="Run token merging analysis on ViT models with "
+                             "theoretical speedup estimation")
+    parser.add_argument("--merge-ratios", type=str, default="0.3,0.5,0.7,0.9",
+                        help="Comma-separated keep ratios for token merging "
+                             "(e.g. '0.3,0.5,0.7')")
+    parser.add_argument("--save-merged", action="store_true",
+                        help="Save the token-merged ViT model to the output directory")
+    parser.add_argument("--merge-strategy", type=str, default="bipartite",
+                        choices=["bipartite", "kmeans", "average_pool"],
+                        help="Strategy to use when saving the merged model")
+    parser.add_argument("--merge-ratio", type=float, default=0.5,
+                        help="Keep ratio for the saved merged model (default: 0.5)")
+    parser.add_argument("--quantize", type=str, default=None,
+                        choices=["dynamic", "static", "float16",
+                                 "weight_int8", "weight_int4", "smoothquant"],
+                        help="Quantize the model and save the result. "
+                             "dynamic=INT8 dynamic, static=INT8 calibrated, float16=half, "
+                             "weight_int8=weight-only INT8, weight_int4=weight-only INT4, "
+                             "smoothquant=SmoothQuant W8A8")
+    parser.add_argument("--save-quantized", type=str, default=None,
+                        help="Path to save the quantized model (default: auto-generated in output-dir)")
+    parser.add_argument("--graph-export", action="store_true",
+                        help="Run torch.export graph compilation on model families "
+                             "and output operator analysis + CSV")
+    parser.add_argument("--graph-families", type=str, default="llm,vit,vlm",
+                        help="Comma-separated model families for graph export "
+                             "(e.g. 'llm,vit,vlm')")
+    parser.add_argument("--save-graph", action="store_true",
+                        help="Save exported graphs to output directory as .pt2 (ExportedProgram), "
+                             ".pt (FX GraphModule), .py (readable code), and .txt (tabular)")
+    parser.add_argument("--graph-profile", action="store_true",
+                        help="Run graph-based static profiling: per-node FLOPs, params, "
+                             "activation memory, KV cache, arithmetic intensity, roofline, "
+                             "per-block aggregation")
+    parser.add_argument("--context-lengths", type=str, default="512,1024,2048,4096,8192",
+                        help="Comma-separated context lengths for KV cache estimation")
     args = parser.parse_args()
 
     print("=" * 70)
     print("  MODEL PROFILER & COMPRESSION RECOMMENDER")
     print("  ML to Improve ML — NYU Final Project")
     print("=" * 70)
-    print(f"  Device: {args.device or ('cuda' if torch.cuda.is_available() else 'cpu')}")
     print(f"  Target: {args.target_device}")
-    print(f"  Dynamic profiling: {'OFF' if args.static_only else 'ON'}")
     print("=" * 70)
 
-    # Initialize profilers
+    # ── Graph export mode ──
+    if args.graph_export:
+        families = [f.strip() for f in args.graph_families.split(",") if f.strip()]
+        local_path = os.path.abspath(args.local) if args.local else None
+        input_shape = (1, 3, 224, 224)
+        if args.input_shape:
+            input_shape = tuple(int(x) for x in args.input_shape.split(","))
+        run_graph_export(
+            families=families,
+            local_path=local_path,
+            input_shape=input_shape,
+            output_dir=args.output_dir,
+            save_graph=args.save_graph,
+        )
+        if "--model" not in sys.argv and not args.local:
+            print("\n Pipeline complete!\n")
+            return
+
+    # Initialize profiler
     static_profiler = StaticProfiler()
-    dynamic_profiler = DynamicProfiler(
-        warmup_runs=args.warmup,
-        benchmark_runs=args.benchmark_runs,
-        device=args.device,
-    )
 
     # ── Local model path ──
     if args.local:
@@ -214,16 +406,39 @@ def main():
             input_shape = (1, 3, 224, 224)
 
         print(f"\n[Local Model] Loading from {local_path}...")
-        loaded = torch.load(local_path, map_location="cpu", weights_only=False)
-        if isinstance(loaded, nn.Module):
-            local_model = loaded
-        elif isinstance(loaded, dict):
-            print("Error: file contains a state_dict, not a full model. "
-                  "Wrap it in an nn.Module and save with torch.save(model, path).")
-            sys.exit(1)
+
+        local_model = None
+        forward_fn = None
+        is_safetensors = local_path.endswith(".safetensors") or _is_safetensors(local_path)
+
+        if is_safetensors:
+            # SafeTensors file — requires --arch to know the model structure
+            if not args.arch:
+                print("Error: safetensors file detected. Use --arch to specify the model "
+                      "architecture (e.g. --arch gpt2, --arch google/vit-base-patch16-224)")
+                sys.exit(1)
+            local_model, forward_fn = _load_arch_with_weights(
+                args.arch, local_path, is_safetensors=True)
         else:
-            print(f"Error: unexpected type in file: {type(loaded)}")
-            sys.exit(1)
+            try:
+                loaded = torch.load(local_path, map_location="cpu", weights_only=False)
+            except Exception as e:
+                print(f"Error loading file: {e}")
+                sys.exit(1)
+
+            if isinstance(loaded, nn.Module):
+                local_model = loaded
+            elif isinstance(loaded, dict):
+                # state_dict — requires --arch
+                if not args.arch:
+                    print("Error: file contains a state_dict. Use --arch to specify the model "
+                          "architecture (e.g. --arch gpt2, --arch resnet18)")
+                    sys.exit(1)
+                local_model, forward_fn = _load_arch_with_weights(
+                    args.arch, local_path, state_dict=loaded)
+            else:
+                print(f"Error: unexpected type in file: {type(loaded)}")
+                sys.exit(1)
 
         local_name = os.path.splitext(os.path.basename(local_path))[0]
         sample_input = torch.randn(*input_shape)
@@ -231,12 +446,37 @@ def main():
 
         all_results = {}
         result = profile_single_model(
-            local_name, local_model, sample_input, None,
-            static_profiler, dynamic_profiler,
-            run_dynamic=not args.static_only,
-            target_device=args.target_device,
+            local_name, local_model, sample_input, forward_fn,
+            static_profiler, target_device=args.target_device,
         )
         all_results[local_name] = result
+
+        # Graph-based static profiling
+        if args.graph_profile:
+            ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+            graph_result = export_single_model(
+                local_model, sample_input, forward_fn,
+                model_name=local_name, model_family="local",
+            )
+            if graph_result.success:
+                gsp = static_profiler.profile_from_graph(
+                    local_model, graph_result,
+                    model_name=local_name, model_family="local",
+                    target_context_lengths=ctx_lens,
+                )
+                print(gsp.summary())
+
+        # Quantize if requested
+        if args.quantize:
+            safe_name = local_name.lower().replace(" ", "_").replace("-", "_")
+            save_path = args.save_quantized or os.path.join(
+                args.output_dir, f"{safe_name}_quantized_{args.quantize}.pt"
+            )
+            quantized, qresult = quantize_model(
+                local_model, method=args.quantize,
+                model_name=local_name, sample_input=sample_input,
+                forward_fn=forward_fn, save_path=save_path,
+            )
 
         print("\n[Saving Results]")
         save_results(all_results, args.output_dir)
@@ -251,7 +491,6 @@ def main():
         "gpt2-large": ("GPT-2-Large", lambda: load_gpt2("gpt2-large")),
         "resnet": ("ResNet-18", load_resnet18),
         "vit": ("ViT-Base", load_vit),
-        "blackbox": ("Blackbox", load_blackbox_model),
     }
 
     if args.model == "all":
@@ -265,11 +504,52 @@ def main():
             model, sample_input, forward_fn = loader()
             result = profile_single_model(
                 name, model, sample_input, forward_fn,
-                static_profiler, dynamic_profiler,
-                run_dynamic=not args.static_only,
-                target_device=args.target_device,
+                static_profiler, target_device=args.target_device,
             )
             all_results[name] = result
+
+            # Graph-based static profiling
+            if args.graph_profile:
+                ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+                family = "llm" if "gpt" in key else ("vit" if "vit" in key else "unknown")
+                graph_result = export_single_model(
+                    model, sample_input, forward_fn,
+                    model_name=name, model_family=family,
+                )
+                if graph_result.success:
+                    gsp = static_profiler.profile_from_graph(
+                        model, graph_result,
+                        model_name=name, model_family=family,
+                        target_context_lengths=ctx_lens,
+                    )
+                    print(gsp.summary())
+                    all_results[name]["graph_profile"] = gsp
+
+            # Quantize if requested
+            if args.quantize:
+                safe_name = name.lower().replace(" ", "_").replace("-", "_")
+                save_path = args.save_quantized or os.path.join(
+                    args.output_dir, f"{safe_name}_quantized_{args.quantize}.pt"
+                )
+                quantized, qresult = quantize_model(
+                    model, method=args.quantize,
+                    model_name=name, sample_input=sample_input,
+                    forward_fn=forward_fn, save_path=save_path,
+                )
+
+            # Token merging analysis for ViT models
+            if args.token_merging and "vit" in key.lower():
+                merge_ratios = [float(r) for r in args.merge_ratios.split(",")]
+                tm_results = analyze_token_merging(
+                    model, sample_input, forward_fn, name,
+                    ratios=merge_ratios,
+                    save_merged=args.save_merged,
+                    save_strategy=args.merge_strategy,
+                    save_ratio=args.merge_ratio,
+                    output_dir=args.output_dir,
+                )
+                if tm_results:
+                    all_results[name]["token_merging"] = tm_results
 
             # Free memory
             del model, sample_input
@@ -277,7 +557,7 @@ def main():
                 torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"\n  ✗ Error profiling {name}: {e}")
+            print(f"\n  Error profiling {name}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -289,7 +569,7 @@ def main():
     print("\n[Saving Results]")
     save_results(all_results, args.output_dir)
 
-    print("\n✓ Pipeline complete!\n")
+    print("\n Pipeline complete!\n")
 
 
 if __name__ == "__main__":
