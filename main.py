@@ -40,6 +40,7 @@ from token_merging import (
 )
 from quantize import quantize_model
 from graph_export import run_graph_export, _export_model as export_single_model
+from dynamic_profile import run_dynamic_profile
 
 
 def apply_quant_plan(model, model_name, compression_plan, sample_input=None,
@@ -564,6 +565,15 @@ def main():
     parser.add_argument("--apply-quantization", action="store_true",
                         help="Apply the compression plan's per-layer quantization assignment "
                              "from --graph and save the mixed-precision quantized model")
+    parser.add_argument("--dynamic-profile", action="store_true",
+                        help="Run torch.profiler dynamic profiling: per-op latency, "
+                             "memory usage, tensor shapes, call stacks, FLOPs")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device for dynamic profiling (cpu/cuda, auto-detected)")
+    parser.add_argument("--save-trace", action="store_true",
+                        help="Save Chrome trace JSON for visualization in chrome://tracing")
+    parser.add_argument("--profile-runs", type=int, default=5,
+                        help="Number of profiled forward passes (default: 5)")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -686,6 +696,15 @@ def main():
                 output_dir=args.output_dir,
             )
 
+        # Dynamic profiling
+        if args.dynamic_profile:
+            run_dynamic_profile(
+                local_model, sample_input,
+                model_name=local_name, forward_fn=forward_fn,
+                device=args.device, num_runs=args.profile_runs,
+                save_trace=args.save_trace, output_dir=args.output_dir,
+            )
+
         print("\n[Saving Results]")
         save_results(all_results, args.output_dir)
         print("\n Pipeline complete!\n")
@@ -779,6 +798,15 @@ def main():
                     model, name, forward_fn, sample_input,
                     strategy=args.merge_strategy, ratio=args.merge_ratio,
                     output_dir=args.output_dir,
+                )
+
+            # Dynamic profiling
+            if args.dynamic_profile:
+                run_dynamic_profile(
+                    model, sample_input,
+                    model_name=name, forward_fn=forward_fn,
+                    device=args.device, num_runs=args.profile_runs,
+                    save_trace=args.save_trace, output_dir=args.output_dir,
                 )
 
             # Free memory

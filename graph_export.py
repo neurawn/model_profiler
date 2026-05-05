@@ -625,23 +625,25 @@ def _export_model(model: nn.Module, sample_input,
     else:
         inp = sample_input
 
-    # Method 1: torch.export.export
-    try:
-        exported = torch.export.export(export_model, (inp,), strict=False)
-    except Exception as e1:
-        errors["torch.export"] = str(e1)
-
-    # Method 2: torch.fx.symbolic_trace
-    if exported is None:
+    # Methods 1-3 are CPU-intensive graph tracing approaches.
+    # Skipped by default — module-walk (Method 4) gives the same FLOPs,
+    # compression plan, and compressibility analysis without the overhead.
+    # Use --full-export to enable these.
+    if full_export:
+        # Method 1: torch.export.export
         try:
-            exported = torch.fx.symbolic_trace(export_model)
-        except Exception as e2:
-            errors["torch.fx"] = str(e2)
+            exported = torch.export.export(export_model, (inp,), strict=False)
+        except Exception as e1:
+            errors["torch.export"] = str(e1)
 
-    # Method 3: torch.compile with custom backend to capture the graph
-    # Skipped by default — triggers Triton/inductor compilation which is
-    # CPU-intensive. Module-walk fallback gives same quality for FLOPs/
-    # compression plan. Use --full-export to enable.
+        # Method 2: torch.fx.symbolic_trace
+        if exported is None:
+            try:
+                exported = torch.fx.symbolic_trace(export_model)
+            except Exception as e2:
+                errors["torch.fx"] = str(e2)
+
+    # Method 3: torch.compile with custom backend
     if exported is None and full_export:
         try:
             captured_graphs = []
