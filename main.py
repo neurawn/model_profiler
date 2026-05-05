@@ -42,6 +42,146 @@ from quantize import quantize_model
 from graph_export import run_graph_export, _export_model as export_single_model
 
 
+def apply_quant_plan(model, model_name, compression_plan, sample_input=None,
+                     forward_fn=None, output_dir="./profiling_results"):
+    """
+    Apply the compression plan's per-layer quantization assignment.
+
+    Each layer gets quantized to its assigned bit-width (4, 8, or 16)
+    using symmetric weight-only quantization. This produces a mixed-precision
+    model where different layers use different bit-widths.
+    """
+    import copy
+
+    print(f"\n{'#'*70}")
+    print(f"#  APPLYING QUANTIZATION PLAN: {model_name}")
+    print(f"#  Avg target bits: {compression_plan.avg_bits:.1f}")
+    print(f"{'#'*70}")
+
+    try:
+        from transformers.pytorch_utils import Conv1D as HFConv1D
+    except ImportError:
+        HFConv1D = None
+
+    linear_types = (nn.Linear,)
+    if HFConv1D is not None:
+        linear_types = (nn.Linear, HFConv1D)
+
+    quantized = copy.deepcopy(model)
+    quantized.eval()
+
+    # Build lookup: module_name -> assigned bits
+    assignment_map = {}
+    for qa in compression_plan.quant_assignments:
+        assignment_map[qa.name] = qa.assigned_bits
+
+    # Build reason lookup
+    reason_map = {}
+    for qa in compression_plan.quant_assignments:
+        reason_map[qa.name] = qa.reason
+
+    # Track stats
+    original_size = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
+    quantized_count = {4: 0, 8: 0, 16: 0}
+    quantized_params = {4: 0, 8: 0, 16: 0}
+    conversion_log = []  # (name, original_dtype, target_bits, params, reason)
+
+    for mod_name, mod in quantized.named_modules():
+        if not isinstance(mod, (*linear_types, nn.Conv2d, nn.Conv1d)):
+            continue
+
+        bits = assignment_map.get(mod_name, 8)  # default to INT8
+        reason = reason_map.get(mod_name, "default INT8")
+
+        weight = mod.weight.data.float()
+        orig_dtype = str(mod.weight.dtype)
+
+        if bits == 16:
+            quantized_count[16] += 1
+            quantized_params[16] += weight.numel()
+            conversion_log.append((mod_name, orig_dtype, "FP16", weight.numel(), reason))
+            continue
+        elif bits == 8:
+            w_max = weight.abs().max().clamp(min=1e-8)
+            scale = w_max / 127.0
+            w_int = torch.clamp(torch.round(weight / scale), -128, 127)
+            w_deq = w_int * scale
+            target_str = "INT8"
+        elif bits == 4:
+            if weight.ndim >= 2:
+                reduce_dims = list(range(1, weight.ndim))
+                w_max = weight.abs().amax(dim=reduce_dims, keepdim=True).clamp(min=1e-8)
+                scale = w_max / 7.0
+                w_int = torch.clamp(torch.round(weight / scale), -8, 7)
+                w_deq = w_int * scale
+            else:
+                w_max = weight.abs().max().clamp(min=1e-8)
+                scale = w_max / 7.0
+                w_int = torch.clamp(torch.round(weight / scale), -8, 7)
+                w_deq = w_int * scale
+            target_str = "INT4"
+        else:
+            continue
+
+        mod.weight.data = w_deq
+        mod.register_buffer("_wq_scale", scale.squeeze())
+        mod.register_buffer("_wq_bits", torch.tensor(bits))
+        quantized_count[bits] += 1
+        quantized_params[bits] += weight.numel()
+        conversion_log.append((mod_name, orig_dtype, target_str, weight.numel(), reason))
+
+    # Verify forward pass
+    if sample_input is not None:
+        print(f"  Verifying quantized model...")
+        fwd = forward_fn if forward_fn else lambda m, x: m(x)
+        with torch.no_grad():
+            fwd(quantized, sample_input.cpu())
+        print(f"  Forward pass OK")
+
+    # Estimate compressed size
+    compressed_bytes = sum(quantized_params[b] * (b / 8) for b in [4, 8, 16])
+    other_bytes = sum(
+        p.numel() * p.element_size() for n, p in quantized.named_parameters()
+        if "weight" not in n
+    )
+    estimated_size_mb = (compressed_bytes + other_bytes) / (1024 * 1024)
+
+    # Print per-layer conversion summary
+    print(f"\n  Per-Layer Quantization:")
+    print(f"  {'Layer':<45s} {'From':>8s} {'To':>6s} {'Params':>12s} Reason")
+    print(f"  {'─'*45} {'─'*8} {'─'*6} {'─'*12} {'─'*35}")
+    for name, orig, target, params, reason in conversion_log:
+        print(f"  {name[:45]:<45s} {orig:>8s} → {target:<5s} {params:>12,} {reason}")
+
+    # Print totals
+    print(f"\n  Summary:")
+    print(f"    INT4 layers:  {quantized_count[4]:>4d} ({quantized_params[4]:>12,} params)")
+    print(f"    INT8 layers:  {quantized_count[8]:>4d} ({quantized_params[8]:>12,} params)")
+    print(f"    FP16 layers:  {quantized_count[16]:>4d} ({quantized_params[16]:>12,} params)")
+    print(f"    Original:     {original_size:.1f} MB")
+    print(f"    Estimated:    {estimated_size_mb:.1f} MB ({1 - estimated_size_mb/original_size:.1%} reduction)")
+
+    # Save
+    os.makedirs(output_dir, exist_ok=True)
+    safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
+    save_path = os.path.join(output_dir, f"{safe_name}_plan_quantized.pt")
+    torch.save({
+        "model_state_dict": quantized.state_dict(),
+        "quant_assignments": [
+            {"name": qa.name, "bits": qa.assigned_bits, "reason": qa.reason}
+            for qa in compression_plan.quant_assignments
+        ],
+        "avg_bits": compression_plan.avg_bits,
+        "layer_counts": quantized_count,
+        "layer_params": quantized_params,
+        "estimated_size_mb": estimated_size_mb,
+    }, save_path)
+    file_size = os.path.getsize(save_path) / (1024 * 1024)
+    print(f"\n  Saved: {save_path} ({file_size:.1f} MB)")
+    print(f"{'#'*70}\n")
+    return save_path
+
+
 def apply_and_save_tome(model, model_name, forward_fn, sample_input,
                         strategy="bipartite", ratio=0.5, output_dir="./profiling_results"):
     """Apply token merging to a ViT/VLM model and save it locally."""
@@ -417,6 +557,9 @@ def main():
                         help="Save exported graphs and CSVs to output directory")
     parser.add_argument("--context-lengths", type=str, default="512,1024,2048,4096,8192",
                         help="Comma-separated context lengths for KV cache estimation")
+    parser.add_argument("--apply-quantization", action="store_true",
+                        help="Apply the compression plan's per-layer quantization assignment "
+                             "from --graph and save the mixed-precision quantized model")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -507,6 +650,17 @@ def main():
                 print(gsp.summary())
                 all_results[local_name]["graph_profile"] = gsp
 
+                # Apply plan-based quantization
+                if args.apply_quantization and gsp.compression_plan:
+                    apply_quant_plan(
+                        local_model, local_name, gsp.compression_plan,
+                        sample_input=sample_input, forward_fn=forward_fn,
+                        output_dir=args.output_dir,
+                    )
+
+        if args.apply_quantization and not args.graph:
+            print("Error: --apply-quantization requires --graph to generate the compression plan first")
+
         # Quantize if requested
         if args.quantize:
             safe_name = local_name.lower().replace(" ", "_").replace("-", "_")
@@ -577,6 +731,14 @@ def main():
                     )
                     print(gsp.summary())
                     all_results[name]["graph_profile"] = gsp
+
+                    # Apply plan-based quantization
+                    if args.apply_quantization and gsp.compression_plan:
+                        apply_quant_plan(
+                            model, name, gsp.compression_plan,
+                            sample_input=sample_input, forward_fn=forward_fn,
+                            output_dir=args.output_dir,
+                        )
 
             # Quantize if requested
             if args.quantize:
