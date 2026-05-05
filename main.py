@@ -42,6 +42,67 @@ from quantize import quantize_model
 from graph_export import run_graph_export, _export_model as export_single_model
 
 
+def apply_and_save_tome(model, model_name, forward_fn, sample_input,
+                        strategy="bipartite", ratio=0.5, output_dir="./profiling_results"):
+    """Apply token merging to a ViT/VLM model and save it locally."""
+    print(f"\n{'#'*70}")
+    print(f"#  APPLYING TOKEN MERGING: {model_name}")
+    print(f"#  Strategy: {strategy}, Keep ratio: {ratio:.0%}")
+    print(f"{'#'*70}")
+
+    try:
+        merged_model = apply_token_merging(
+            model, strategy=strategy, ratio=ratio,
+        )
+
+        # Verify it runs
+        print(f"  Verifying merged model...")
+        merged_model.eval()
+        fwd = forward_fn if forward_fn else lambda m, x: m(x)
+        with torch.no_grad():
+            fwd(merged_model, sample_input)
+        print(f"  Forward pass OK")
+
+        # Save
+        os.makedirs(output_dir, exist_ok=True)
+        safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
+        save_path = os.path.join(
+            output_dir,
+            f"{safe_name}_tome_{strategy}_r{ratio}.pt",
+        )
+
+        # Remove hooks before saving (closures can't be pickled)
+        merged_model.remove_hooks()
+
+        save_data = {
+            "model_state_dict": merged_model.model.state_dict(),
+            "model_class": type(merged_model.model).__name__,
+            "merge_config": {
+                "strategy": strategy,
+                "ratio": ratio,
+                "protect_cls": merged_model.protect_cls,
+                "merge_layers": merged_model.merge_layers,
+            },
+        }
+        torch.save(save_data, save_path)
+        size_mb = os.path.getsize(save_path) / (1024 * 1024)
+
+        print(f"\n  Saved: {save_path} ({size_mb:.1f} MB)")
+        print(f"  Config: strategy={strategy}, ratio={ratio}")
+        print(f"\n  To reload:")
+        print(f"    data = torch.load('{save_path}')")
+        print(f"    model.load_state_dict(data['model_state_dict'])")
+        print(f"    wrapped = apply_token_merging(model, **data['merge_config'])")
+        print(f"{'#'*70}\n")
+        return save_path
+
+    except Exception as e:
+        print(f"  Error applying token merging: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def profile_single_model(model_name, model, sample_input, forward_fn,
                           static_profiler, target_device="gpu"):
     """Run static profiling pipeline on a single model."""
@@ -326,18 +387,19 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./profiling_results",
                         help="Directory to save JSON results")
     parser.add_argument("--token-merging", action="store_true",
-                        help="Run token merging analysis on ViT models with "
+                        help="Run token merging analysis on ViT/VLM models with "
                              "theoretical speedup estimation")
     parser.add_argument("--merge-ratios", type=str, default="0.3,0.5,0.7,0.9",
                         help="Comma-separated keep ratios for token merging "
                              "(e.g. '0.3,0.5,0.7')")
-    parser.add_argument("--save-merged", action="store_true",
-                        help="Save the token-merged ViT model to the output directory")
     parser.add_argument("--merge-strategy", type=str, default="bipartite",
                         choices=["bipartite", "kmeans", "average_pool"],
-                        help="Strategy to use when saving the merged model")
+                        help="Strategy to use for token merging")
     parser.add_argument("--merge-ratio", type=float, default=0.5,
-                        help="Keep ratio for the saved merged model (default: 0.5)")
+                        help="Keep ratio for token merging (default: 0.5)")
+    parser.add_argument("--apply-tome", action="store_true",
+                        help="Apply token merging to ViT/VLM model after profiling "
+                             "and save the merged model locally")
     parser.add_argument("--quantize", type=str, default=None,
                         choices=["dynamic", "static", "float16",
                                  "weight_int8", "weight_int4", "smoothquant"],
@@ -457,6 +519,14 @@ def main():
                 forward_fn=forward_fn, save_path=save_path,
             )
 
+        # Apply token merging and save
+        if args.apply_tome:
+            apply_and_save_tome(
+                local_model, local_name, forward_fn, sample_input,
+                strategy=args.merge_strategy, ratio=args.merge_ratio,
+                output_dir=args.output_dir,
+            )
+
         print("\n[Saving Results]")
         save_results(all_results, args.output_dir)
         print("\n Pipeline complete!\n")
@@ -520,19 +590,28 @@ def main():
                     forward_fn=forward_fn, save_path=save_path,
                 )
 
-            # Token merging analysis for ViT models
-            if args.token_merging and "vit" in key.lower():
+            # Token merging analysis for ViT/VLM models
+            is_vision = any(k in key.lower() for k in ["vit", "vlm", "clip"])
+            if args.token_merging and is_vision:
                 merge_ratios = [float(r) for r in args.merge_ratios.split(",")]
                 tm_results = analyze_token_merging(
                     model, sample_input, forward_fn, name,
                     ratios=merge_ratios,
-                    save_merged=args.save_merged,
+                    save_merged=False,
                     save_strategy=args.merge_strategy,
                     save_ratio=args.merge_ratio,
                     output_dir=args.output_dir,
                 )
                 if tm_results:
                     all_results[name]["token_merging"] = tm_results
+
+            # Apply token merging and save model
+            if args.apply_tome and is_vision:
+                apply_and_save_tome(
+                    model, name, forward_fn, sample_input,
+                    strategy=args.merge_strategy, ratio=args.merge_ratio,
+                    output_dir=args.output_dir,
+                )
 
             # Free memory
             del model, sample_input
