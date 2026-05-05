@@ -118,15 +118,35 @@ class KVQuantPriority:
 
 
 @dataclass
+class TokenMergingEstimate:
+    """Token merging estimate for a given keep ratio."""
+    keep_ratio: float
+    original_tokens: int
+    merged_tokens: int
+    original_flops: int
+    merged_flops: int
+    flops_reduction: float  # fraction saved
+    attn_speedup: float
+    ffn_speedup: float
+    overall_speedup: float
+    recommended_strategy: str
+    reason: str
+
+
+@dataclass
 class CompressionPlan:
     """Complete compression plan derived from graph static profiling."""
     model_name: str
+
+    # 0. Token merging (ViT/VLM only, applied before quantization)
+    token_merging: Optional[List[TokenMergingEstimate]] = None
+    has_token_merging: bool = False
 
     # 1. Pareto ranking
     pareto_layers: List[ParetoLayer] = field(default_factory=list)
     top_k_cover_80_flops: int = 0  # how many layers cover 80% of FLOPs
 
-    # 2. Quant assignment
+    # 2. Quant assignment (accounts for token merging if applicable)
     quant_assignments: List[QuantAssignment] = field(default_factory=list)
     avg_bits: float = 0.0  # effective average bit-width
 
@@ -146,6 +166,32 @@ class CompressionPlan:
             f"  COMPRESSION PLAN: {self.model_name}",
             f"{'='*70}",
         ]
+
+        # 0. Token merging (ViT/VLM only)
+        if self.has_token_merging and self.token_merging:
+            lines += [
+                f"\n  0. TOKEN MERGING (apply before quantization)",
+                f"     Reduces sequence length → quadratic attention savings + linear FFN savings",
+                f"     {'Ratio':<8s} {'Tokens':>12s} {'FLOPs':>16s} {'Saved':>8s} "
+                f"{'Attn':>7s} {'FFN':>7s} {'Overall':>8s} {'Strategy'}",
+                f"     {'─'*8} {'─'*12} {'─'*16} {'─'*8} {'─'*7} {'─'*7} {'─'*8} {'─'*20}",
+            ]
+            for tm in self.token_merging:
+                lines.append(
+                    f"     {tm.keep_ratio:<8.0%} "
+                    f"{tm.original_tokens:>5d} → {tm.merged_tokens:<5d} "
+                    f"{tm.original_flops/1e9:.1f}G → {tm.merged_flops/1e9:.1f}G "
+                    f"{tm.flops_reduction:>7.1%} "
+                    f"{tm.attn_speedup:>6.2f}x {tm.ffn_speedup:>6.2f}x "
+                    f"{tm.overall_speedup:>7.2f}x {tm.recommended_strategy}"
+                )
+            best = max(self.token_merging, key=lambda t: t.overall_speedup)
+            lines += [
+                f"",
+                f"     Recommended: {best.keep_ratio:.0%} keep ratio with {best.recommended_strategy}",
+                f"     {best.reason}",
+                f"     Apply token merging FIRST, then quantize the merged model",
+            ]
 
         # 1. Pareto ranking
         lines += [
@@ -214,41 +260,56 @@ class CompressionPlan:
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "model_name": self.model_name,
-            "pareto": {
-                "top_k_cover_80_flops": self.top_k_cover_80_flops,
-                "layers": [
-                    {"name": pl.name, "flops_share": round(pl.flops_share, 4),
-                     "param_share": round(pl.param_share, 4)}
-                    for pl in self.pareto_layers
-                ],
-            },
-            "quant_assignment": {
-                "avg_bits": round(self.avg_bits, 2),
-                "assignments": [
-                    {"name": qa.name, "bits": qa.assigned_bits,
-                     "params": qa.params, "reason": qa.reason}
-                    for qa in self.quant_assignments
-                ],
-            },
-            "pruning_candidates": [
-                {"name": pc.name, "params": pc.params,
-                 "cost_to_param_ratio": round(pc.cost_to_param_ratio, 2),
-                 "reason": pc.reason}
-                for pc in self.pruning_candidates
-            ],
-            "kv_quant": {
-                "target_context": self.target_context,
-                "total_kv_mb": round(self.total_kv_mb, 2),
-                "after_quant_mb": round(self.kv_after_quant_mb, 2),
-                "priorities": [
-                    {"layer": kvp.layer_name, "kv_mb": round(kvp.kv_memory_mb, 2),
-                     "bits": kvp.recommended_bits, "reason": kvp.reason}
-                    for kvp in self.kv_priorities
-                ],
-            },
         }
+        if self.has_token_merging and self.token_merging:
+            result["token_merging"] = [
+                {
+                    "keep_ratio": tm.keep_ratio,
+                    "original_tokens": tm.original_tokens,
+                    "merged_tokens": tm.merged_tokens,
+                    "original_flops": tm.original_flops,
+                    "merged_flops": tm.merged_flops,
+                    "flops_reduction": round(tm.flops_reduction, 4),
+                    "overall_speedup": round(tm.overall_speedup, 2),
+                    "strategy": tm.recommended_strategy,
+                }
+                for tm in self.token_merging
+            ]
+        result["pareto"] = {
+            "top_k_cover_80_flops": self.top_k_cover_80_flops,
+            "layers": [
+                {"name": pl.name, "flops_share": round(pl.flops_share, 4),
+                 "param_share": round(pl.param_share, 4)}
+                for pl in self.pareto_layers
+            ],
+        }
+        result["quant_assignment"] = {
+            "avg_bits": round(self.avg_bits, 2),
+            "assignments": [
+                {"name": qa.name, "bits": qa.assigned_bits,
+                 "params": qa.params, "reason": qa.reason}
+                for qa in self.quant_assignments
+            ],
+        }
+        result["pruning_candidates"] = [
+            {"name": pc.name, "params": pc.params,
+             "cost_to_param_ratio": round(pc.cost_to_param_ratio, 2),
+             "reason": pc.reason}
+            for pc in self.pruning_candidates
+        ]
+        result["kv_quant"] = {
+            "target_context": self.target_context,
+            "total_kv_mb": round(self.total_kv_mb, 2),
+            "after_quant_mb": round(self.kv_after_quant_mb, 2),
+            "priorities": [
+                {"layer": kvp.layer_name, "kv_mb": round(kvp.kv_memory_mb, 2),
+                 "bits": kvp.recommended_bits, "reason": kvp.reason}
+                for kvp in self.kv_priorities
+            ],
+        }
+        return result
 
 
 @dataclass
@@ -465,16 +526,7 @@ class StaticProfile:
             "total_size_mb": round(self.total_size_mb, 2),
             "layer_type_counts": self.layer_type_counts,
             "layer_type_params": self.layer_type_params,
-            "param_uniformity_score": round(self.param_uniformity_score, 4),
-            "overall_sparsity": round(self.overall_sparsity, 4),
-            "weight_entropy": round(self.weight_entropy, 4),
-            "has_attention": self.has_attention,
-            "has_convolutions": self.has_convolutions,
-            "dominant_layer_type": self.dominant_layer_type,
             "depth": self.depth,
-            "quantization_friendliness": round(self.quantization_friendliness, 4),
-            "pruning_friendliness": round(self.pruning_friendliness, 4),
-            "distillation_friendliness": round(self.distillation_friendliness, 4),
         }
         return result
 
@@ -494,24 +546,7 @@ class StaticProfile:
             params = self.layer_type_params.get(ltype, 0)
             lines.append(f"    {ltype:20s}  count={count:4d}  params={params:>12,}")
 
-        lines += [
-            f"{'─'*60}",
-            f"  Architecture Features:",
-            f"    Has Attention:      {self.has_attention}",
-            f"    Has Convolutions:   {self.has_convolutions}",
-            f"    Dominant Type:      {self.dominant_layer_type}",
-            f"{'─'*60}",
-            f"  Distribution Analysis:",
-            f"    Param Uniformity:   {self.param_uniformity_score:.4f}  (1=uniform, 0=uneven)",
-            f"    Overall Sparsity:   {self.overall_sparsity:.4f}  (fraction near-zero)",
-            f"    Weight Entropy:     {self.weight_entropy:.4f}",
-            f"{'─'*60}",
-            f"  Compression Friendliness Scores (0-1):",
-            f"    Quantization:       {self.quantization_friendliness:.4f}",
-            f"    Pruning:            {self.pruning_friendliness:.4f}",
-            f"    Distillation:       {self.distillation_friendliness:.4f}",
-            f"{'='*60}\n",
-        ]
+        lines.append(f"{'='*60}\n")
         return "\n".join(lines)
 
 
@@ -818,28 +853,37 @@ class StaticProfiler:
     # Graph-based static profiling
     # ════════════════════════════════════════════════════════════════
 
-    # FLOPs estimation per op type (conservative estimates)
-    _FLOP_RULES = {
-        # Linear: 2 * in * out
-        "linear": lambda s: 2 * s[0] * s[1] if len(s) >= 2 else 0,
-        "addmm": lambda s: 2 * s[0] * s[1] if len(s) >= 2 else 0,
-        "mm": lambda s: 2 * s[0] * s[1] if len(s) >= 2 else 0,
-        "matmul": lambda s: 2 * s[0] * s[1] if len(s) >= 2 else 0,
-        "bmm": lambda s: 2 * s[0] * s[1] * s[2] if len(s) >= 3 else 0,
-        # Conv2d: 2 * Cout * Cin * K^2 * Hout * Wout
-        "conv2d": lambda s: 2 * s[0] * s[1] * s[2] if len(s) >= 3 else 0,
-        # Attention: 2 * T^2 * D (for Q@K^T) + 2 * T^2 * D (for attn@V)
-        "scaled_dot_product_attention": lambda s: 4 * s[0] * s[0] * s[1] if len(s) >= 2 else 0,
-        # Norms: 5 * N (mean, var, normalize, scale, bias)
-        "layer_norm": lambda s: 5 * s[0] if len(s) >= 1 else 0,
-        "batch_norm": lambda s: 5 * s[0] if len(s) >= 1 else 0,
-        # Activations: N
-        "gelu": lambda s: s[0] if len(s) >= 1 else 0,
-        "relu": lambda s: s[0] if len(s) >= 1 else 0,
-        "silu": lambda s: s[0] if len(s) >= 1 else 0,
-        # Embedding: lookup, ~0 FLOPs
-        "embedding": lambda s: 0,
-    }
+    # FLOPs estimation per op type
+    # For weight shapes (out, in): FLOPs = 2 * in * out per token/sample
+    # _seq_len is set per-model before profiling to scale by sequence length
+    _seq_len = 1  # default, overridden per model
+
+    @staticmethod
+    def _make_flop_rules(seq_len: int = 1):
+        """Create FLOPs estimation rules scaled by sequence/token count."""
+        return {
+            # Linear: 2 * in * out * seq_len (weight shape is [out, in])
+            "linear": lambda s: 2 * s[0] * s[1] * seq_len if len(s) >= 2 else 0,
+            "addmm": lambda s: 2 * s[0] * s[1] * seq_len if len(s) >= 2 else 0,
+            "mm": lambda s: 2 * s[0] * s[1] * seq_len if len(s) >= 2 else 0,
+            "matmul": lambda s: 2 * s[0] * s[1] * seq_len if len(s) >= 2 else 0,
+            "bmm": lambda s: 2 * s[0] * s[1] * s[2] if len(s) >= 3 else 0,
+            # Conv2d: 2 * Cout * Cin * Kh * Kw (weight shape is [Cout, Cin, Kh, Kw])
+            "conv2d": lambda s: 2 * s[0] * s[1] * s[2] * s[3] if len(s) >= 4 else (
+                2 * s[0] * s[1] * s[2] if len(s) >= 3 else 0),
+            # Attention: 4 * T^2 * D (Q@K^T + attn@V)
+            "scaled_dot_product_attention": lambda s: (
+                4 * seq_len * seq_len * s[1] if len(s) >= 2 else 0),
+            # Norms: 5 * hidden * seq_len
+            "layer_norm": lambda s: 5 * s[0] * seq_len if len(s) >= 1 else 0,
+            "batch_norm": lambda s: 5 * s[0] if len(s) >= 1 else 0,
+            # Activations: hidden * seq_len
+            "gelu": lambda s: s[0] * seq_len if len(s) >= 1 else 0,
+            "relu": lambda s: s[0] * seq_len if len(s) >= 1 else 0,
+            "silu": lambda s: s[0] * seq_len if len(s) >= 1 else 0,
+            # Embedding: lookup, ~0 FLOPs
+            "embedding": lambda s: 0,
+        }
 
     # Default hardware roofline (A100-like)
     DEFAULT_PEAK_TFLOPS = 312e12  # FP16 peak
@@ -884,65 +928,180 @@ class StaticProfiler:
         param_dict = dict(model.named_parameters())
         buffer_dict = dict(model.named_buffers())
 
-        # ── 1. Per-node profiling ──
-        node_profiles = []
+        # Detect sequence length for FLOPs scaling
+        config = getattr(model, 'config', None)
+        if config:
+            # ViT: num_patches + 1 (cls token)
+            image_size = getattr(config, 'image_size', 0)
+            patch_size = getattr(config, 'patch_size', 0)
+            if image_size and patch_size:
+                seq_len = (image_size // patch_size) ** 2 + 1  # +1 for CLS
+            else:
+                # LLM: infer from config
+                n_positions = getattr(config, 'n_positions', 0) or getattr(config, 'max_position_embeddings', 0)
+                seq_len = min(n_positions, 1024) if n_positions else 1
+        else:
+            seq_len = 1
+
+        flop_rules = self._make_flop_rules(seq_len)
+
+        # ── 1. Build param-to-node mapping ──
+        # For torch.compile graphs, placeholders hold params with names like
+        # "p_m_vit_encoder_layer_0_attention_attention_query_weight".
+        # Map these back to actual param names by converting underscores to dots.
+        placeholder_param_map = {}  # placeholder_name -> (param_name, param_tensor)
         for gnode in graph_result.nodes:
-            if gnode.op in ("placeholder", "output"):
+            if gnode.op == "placeholder" and gnode.name.startswith("p_"):
+                # Convert: p_m_vit_encoder_layer_0_... -> vit.encoder.layer.0....
+                # Strip "p_m_" or "p_" prefix, then try to match
+                stripped = gnode.name
+                for prefix in ["p_m_", "p_"]:
+                    if stripped.startswith(prefix):
+                        stripped = stripped[len(prefix):]
+                        break
+                # Try dotted version
+                dotted = stripped.replace("_", ".")
+                # Find best matching param name
+                best_match = None
+                best_len = 0
+                for pname in param_dict:
+                    # Normalize both for comparison
+                    pname_norm = pname.replace(".", "_")
+                    if pname_norm == stripped or stripped.endswith(pname_norm):
+                        if len(pname) > best_len:
+                            best_match = pname
+                            best_len = len(pname)
+                    elif pname == dotted:
+                        best_match = pname
+                        best_len = len(pname)
+                if best_match:
+                    placeholder_param_map[gnode.name] = (best_match, param_dict[best_match])
+
+        # Build a map: op_node_name -> list of param shapes consumed
+        # by tracing which placeholders each op node uses
+        # For module-walk fallback, we match by name substring instead
+        is_compile_graph = any(n.name.startswith("p_") and n.op == "placeholder"
+                               for n in graph_result.nodes)
+
+        # ── 2. Build ordered module lists by type for index-based matching ──
+        # HuggingFace GPT-2 uses Conv1D instead of nn.Linear, so detect it
+        try:
+            from transformers.pytorch_utils import Conv1D as HFConv1D
+        except ImportError:
+            HFConv1D = None
+
+        linear_types = [nn.Linear]
+        if HFConv1D is not None:
+            linear_types.append(HFConv1D)
+        linear_types = tuple(linear_types)
+
+        # Ordered lists of modules by op category
+        linear_modules = [(name, m) for name, m in model.named_modules()
+                          if isinstance(m, linear_types)]
+        conv2d_modules = [(name, m) for name, m in model.named_modules()
+                          if isinstance(m, nn.Conv2d)]
+        ln_modules = [(name, m) for name, m in model.named_modules()
+                      if isinstance(m, nn.LayerNorm)]
+        embed_modules = [(name, m) for name, m in model.named_modules()
+                         if isinstance(m, nn.Embedding)]
+
+        # Counters for graph-op-to-module matching (compile graphs)
+        import re as _re
+        op_counters = {}  # base_op_name -> next index to assign
+
+        def _get_op_index(node_name):
+            """Get the sequential index for this op type."""
+            base = _re.sub(r'_\d+$', '', node_name)
+            idx_match = _re.search(r'_(\d+)$', node_name)
+            if idx_match:
+                return base, int(idx_match.group(1))
+            # No numeric suffix — use a counter
+            if base not in op_counters:
+                op_counters[base] = 0
+            idx = op_counters[base]
+            op_counters[base] += 1
+            return base, idx
+
+        # For compile graphs, build a mapping of which graph ops correspond
+        # to linear/matmul operations by scanning for embedding/addmm/mm patterns
+        # that consume weight placeholders
+        linear_op_counter = 0
+        conv2d_op_counter = 0
+        ln_op_counter = 0
+        embed_op_counter = 0
+
+        # ── 3. Per-node profiling from model modules directly ──
+        # Graph node names from torch.compile are unreliable (hex pointers,
+        # mangled names). Instead, build per-node profiles by walking the
+        # model's module tree — this works for all model types.
+        node_profiles = []
+
+        for mod_name, mod in model.named_modules():
+            # Only leaf modules with parameters
+            if len(list(mod.children())) > 0:
+                continue
+            mod_params = sum(p.numel() for p in mod.parameters())
+            if mod_params == 0:
                 continue
 
-            np_ = NodeProfile(
-                name=gnode.name,
-                op_type=gnode.target,
-                compressible=gnode.compressible,
-                compress_methods=gnode.compress_methods,
-            )
+            mod_type = type(mod).__name__
+            shapes = [tuple(p.shape) for p in mod.parameters()]
 
-            # Estimate params for this node
-            # Match node name to model parameters
-            node_params = 0
-            node_shapes = []
-            for pname, p in param_dict.items():
-                # Check if this parameter belongs to this node
-                # e.g. node "linear_0" matches param "h.0.attn.c_attn.weight"
-                if gnode.name in pname or pname.startswith(gnode.name + "."):
-                    node_params += p.numel()
-                    node_shapes.append(tuple(p.shape))
-
-            np_.params = node_params
-
-            # Estimate FLOPs from op type and param shapes
-            target_lower = gnode.target.lower()
-            flops = 0
-            for rule_key, rule_fn in self._FLOP_RULES.items():
-                if rule_key in target_lower:
-                    for shape in node_shapes:
-                        flops += rule_fn(list(shape))
-                    if not node_shapes and node_params > 0:
-                        # Fallback: assume 2 * params FLOPs for linear-like ops
-                        if any(k in target_lower for k in ["linear", "proj", "dense", "fc"]):
-                            flops = 2 * node_params
+            # Determine compressibility from graph result if available
+            compressible = False
+            compress_methods = []
+            for gnode in graph_result.nodes:
+                if mod_name in gnode.name or gnode.name in mod_name:
+                    compressible = gnode.compressible
+                    compress_methods = gnode.compress_methods
                     break
 
-            if flops == 0 and node_params > 0:
+            np_ = NodeProfile(
+                name=mod_name,
+                op_type=mod_type,
+                params=mod_params,
+                compressible=compressible,
+                compress_methods=compress_methods,
+            )
+
+            node_shapes = shapes
+            # HuggingFace Conv1D is functionally a Linear layer
+            is_hf_conv1d = (HFConv1D is not None and isinstance(mod, HFConv1D))
+            match_str = mod_type.lower() + " " + mod_name.lower()
+            if is_hf_conv1d:
+                match_str += " linear"  # treat Conv1D as linear for FLOPs
+
+            # Estimate FLOPs from op type AND module name
+            flops = 0
+            for rule_key, rule_fn in flop_rules.items():
+                if rule_key in match_str:
+                    for shape in node_shapes:
+                        flops += rule_fn(list(shape))
+                    if not node_shapes and mod_params > 0:
+                        if any(k in match_str for k in ["linear", "proj", "dense", "fc"]):
+                            flops = 2 * mod_params * seq_len
+                    break
+
+            if flops == 0 and mod_params > 0:
                 # Generic fallback for parameterized ops
-                if any(k in target_lower for k in ["linear", "conv", "matmul",
+                if any(k in match_str for k in ["linear", "conv", "matmul",
                        "proj", "dense", "fc", "mlp", "intermediate", "attention"]):
-                    flops = 2 * node_params
+                    flops = 2 * mod_params * seq_len
             np_.flops = flops
 
-            # Activation memory: estimate output tensor size
-            # For linear: output = batch * out_features * dtype_bytes
+            # Activation memory: output tensor size = out_features * seq_len * 4 bytes
             act_bytes = 0
-            if node_shapes:
-                largest = max(node_shapes, key=lambda s: s[-1] if s else 0)
+            if shapes:
+                largest = max(shapes, key=lambda s: s[0] if s else 0)
                 if len(largest) >= 2:
-                    act_bytes = largest[-1] * 4  # batch=1, fp32
+                    # Linear/Conv1D weight: (out, in) — output is out * seq_len
+                    act_bytes = largest[0] * seq_len * 4
                 elif len(largest) == 1:
-                    act_bytes = largest[0] * 4
+                    act_bytes = largest[0] * seq_len * 4
             np_.activation_memory_bytes = act_bytes
 
             # Arithmetic intensity = FLOPs / bytes_accessed
-            bytes_accessed = node_params * 4 + act_bytes  # weights + output
+            bytes_accessed = mod_params * 4 + act_bytes  # weights + output
             if bytes_accessed > 0 and flops > 0:
                 np_.arithmetic_intensity = flops / bytes_accessed
                 np_.roofline_bound = ("compute" if np_.arithmetic_intensity >= ridge_point
@@ -999,6 +1158,7 @@ class StaticProfiler:
         Build a compression plan from graph static profile data.
 
         Components:
+        0. Token merging (ViT/VLM): reduce tokens before quantization
         1. Pareto ranking: top-K layers by cost share
         2. Quant assignment: bit-widths from intensity + layer role
         3. Pruning candidates: layers with low cost-to-param ratio
@@ -1010,6 +1170,73 @@ class StaticProfiler:
         active = [n for n in gsp.node_profiles if n.flops > 0 or n.params > 0]
         total_flops = max(gsp.total_flops, 1)
         total_params = max(gsp.total_params, 1)
+
+        # ═══ 0. Token merging for ViT/VLM ═══
+        # Detect if model has patch-based token sequence (ViT, CLIP vision)
+        config = getattr(model, 'config', None)
+        seq_len = 0
+        image_size = 0
+        patch_size = 0
+
+        if config:
+            image_size = getattr(config, 'image_size', 0)
+            patch_size = getattr(config, 'patch_size', 0)
+            # Also check for CLIP's vision config
+            vision_config = getattr(config, 'vision_config', None)
+            if vision_config and not image_size:
+                image_size = getattr(vision_config, 'image_size', 0)
+                patch_size = getattr(vision_config, 'patch_size', 0)
+
+        if image_size and patch_size:
+            seq_len = (image_size // patch_size) ** 2 + 1  # +1 for CLS
+            plan.has_token_merging = True
+            plan.token_merging = []
+
+            for keep_ratio in [0.9, 0.7, 0.5, 0.3]:
+                merged_tokens = max(2, int(seq_len * keep_ratio))
+                r = merged_tokens / seq_len
+
+                # Attention FLOPs scale O(T^2 * D): speedup = (1/r)^2
+                attn_speedup = 1.0 / (r ** 2) if r > 0 else 1.0
+                # FFN FLOPs scale O(T * D^2): speedup = 1/r
+                ffn_speedup = 1.0 / r if r > 0 else 1.0
+                # Weighted: attention ~40% of ViT compute, FFN ~60%
+                overall_speedup = 1.0 / (0.4 * r**2 + 0.6 * r) if r > 0 else 1.0
+
+                merged_flops = int(total_flops / overall_speedup) if overall_speedup > 0 else total_flops
+                # Correct: merged_flops should be smaller
+                merged_flops = int(total_flops * (0.4 * r**2 + 0.6 * r))
+                flops_reduction = 1.0 - (merged_flops / total_flops) if total_flops > 0 else 0
+
+                # Strategy recommendation
+                if keep_ratio >= 0.7:
+                    strategy = "bipartite"
+                    reason = (f"At {keep_ratio:.0%} keep: bipartite matching preserves "
+                              f"semantic similarity with {overall_speedup:.2f}x speedup "
+                              f"and minimal accuracy loss (<1% on ImageNet)")
+                elif keep_ratio >= 0.5:
+                    strategy = "bipartite"
+                    reason = (f"At {keep_ratio:.0%} keep: bipartite matching gives "
+                              f"{overall_speedup:.2f}x speedup with moderate accuracy tradeoff "
+                              f"(~1-3% on ImageNet)")
+                else:
+                    strategy = "kmeans"
+                    reason = (f"At {keep_ratio:.0%} keep: k-means clustering better preserves "
+                              f"spatial structure at high compression ({overall_speedup:.2f}x speedup)")
+
+                plan.token_merging.append(TokenMergingEstimate(
+                    keep_ratio=keep_ratio,
+                    original_tokens=seq_len,
+                    merged_tokens=merged_tokens,
+                    original_flops=total_flops,
+                    merged_flops=merged_flops,
+                    flops_reduction=flops_reduction,
+                    attn_speedup=attn_speedup,
+                    ffn_speedup=ffn_speedup,
+                    overall_speedup=overall_speedup,
+                    recommended_strategy=strategy,
+                    reason=reason,
+                ))
 
         # ═══ 1. Pareto ranking ═══
         ranked = sorted(active, key=lambda n: -n.flops)

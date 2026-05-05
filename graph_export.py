@@ -626,9 +626,7 @@ def _export_model(model: nn.Module, sample_input,
 
     # Method 1: torch.export.export
     try:
-        print("Export: ", model_name, model_family)
         exported = torch.export.export(export_model, (inp,), strict=False)
-        print("After export, graph is " + "None" if exported is None else "Good")
     except Exception as e1:
         errors["torch.export"] = str(e1)
         print(str(e1))
@@ -636,9 +634,7 @@ def _export_model(model: nn.Module, sample_input,
     # Method 2: torch.fx.symbolic_trace
     if exported is None:
         try:
-            print("Fx symbolic trace graph: ", model_name, model_family)
             exported = torch.fx.symbolic_trace(export_model)
-            print("After fx, graph is " + "None" if exported is None else "Good")
         except Exception as e2:
             errors["torch.fx"] = str(e2)
             print(str(e2))
@@ -652,9 +648,7 @@ def _export_model(model: nn.Module, sample_input,
                 captured_graphs.append(gm)
                 return gm
 
-            print("Compile: ", model_name, model_family)
             compiled = torch.compile(export_model, backend=_capture_backend)
-            print("After Compile, graph is " + "None" if exported is None else "Good")
             with torch.no_grad():
                 compiled(inp)
 

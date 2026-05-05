@@ -32,7 +32,7 @@ os.environ["HF_HOME"] = MODEL_DIR
 from static_profiler import StaticProfiler
 from compression_recommender import CompressionRecommender, recommend_for_model
 from models import (
-    load_gpt2, load_resnet18, load_vit,
+    load_gpt2, load_resnet18, load_vit, load_vlm,
     gpt2_input_fn, resnet_input_fn, vit_input_fn,
 )
 from token_merging import (
@@ -308,7 +308,7 @@ def main():
     )
     parser.add_argument("--model", type=str, default="all",
                         choices=["all", "gpt2", "gpt2-medium", "gpt2-large",
-                                 "resnet", "vit"],
+                                 "resnet", "vit", "vlm"],
                         help="Which model to profile")
     parser.add_argument("--local", type=str, default=None,
                         help="Path to a local PyTorch model file (.pt/.pth). "
@@ -347,19 +347,12 @@ def main():
                              "smoothquant=SmoothQuant W8A8")
     parser.add_argument("--save-quantized", type=str, default=None,
                         help="Path to save the quantized model (default: auto-generated in output-dir)")
-    parser.add_argument("--graph-export", action="store_true",
-                        help="Run torch.export graph compilation on model families "
-                             "and output operator analysis + CSV")
-    parser.add_argument("--graph-families", type=str, default="llm,vit,vlm",
-                        help="Comma-separated model families for graph export "
-                             "(e.g. 'llm,vit,vlm')")
+    parser.add_argument("--graph", action="store_true",
+                        help="Run full graph analysis: export graph, compressible op detection, "
+                             "per-node FLOPs/params/activation memory, KV cache, roofline, "
+                             "and compression plan")
     parser.add_argument("--save-graph", action="store_true",
-                        help="Save exported graphs to output directory as .pt2 (ExportedProgram), "
-                             ".pt (FX GraphModule), .py (readable code), and .txt (tabular)")
-    parser.add_argument("--graph-profile", action="store_true",
-                        help="Run graph-based static profiling: per-node FLOPs, params, "
-                             "activation memory, KV cache, arithmetic intensity, roofline, "
-                             "per-block aggregation")
+                        help="Save exported graphs and CSVs to output directory")
     parser.add_argument("--context-lengths", type=str, default="512,1024,2048,4096,8192",
                         help="Comma-separated context lengths for KV cache estimation")
     args = parser.parse_args()
@@ -371,23 +364,7 @@ def main():
     print(f"  Target: {args.target_device}")
     print("=" * 70)
 
-    # ── Graph export mode ──
-    if args.graph_export:
-        families = [f.strip() for f in args.graph_families.split(",") if f.strip()]
-        local_path = os.path.abspath(args.local) if args.local else None
-        input_shape = (1, 3, 224, 224)
-        if args.input_shape:
-            input_shape = tuple(int(x) for x in args.input_shape.split(","))
-        run_graph_export(
-            families=families,
-            local_path=local_path,
-            input_shape=input_shape,
-            output_dir=args.output_dir,
-            save_graph=args.save_graph,
-        )
-        if "--model" not in sys.argv and not args.local:
-            print("\n Pipeline complete!\n")
-            return
+    ctx_lens = [int(x) for x in args.context_lengths.split(",")]
 
     # Initialize profiler
     static_profiler = StaticProfiler()
@@ -451,13 +428,14 @@ def main():
         )
         all_results[local_name] = result
 
-        # Graph-based static profiling
-        if args.graph_profile:
-            ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+        # Graph analysis (export + profiling + compression plan)
+        if args.graph:
             graph_result = export_single_model(
                 local_model, sample_input, forward_fn,
                 model_name=local_name, model_family="local",
+                save_graph=args.save_graph, output_dir=args.output_dir,
             )
+            print(graph_result.summary())
             if graph_result.success:
                 gsp = static_profiler.profile_from_graph(
                     local_model, graph_result,
@@ -465,6 +443,7 @@ def main():
                     target_context_lengths=ctx_lens,
                 )
                 print(gsp.summary())
+                all_results[local_name]["graph_profile"] = gsp
 
         # Quantize if requested
         if args.quantize:
@@ -491,6 +470,7 @@ def main():
         "gpt2-large": ("GPT-2-Large", lambda: load_gpt2("gpt2-large")),
         "resnet": ("ResNet-18", load_resnet18),
         "vit": ("ViT-Base", load_vit),
+        "vlm": ("CLIP-ViT-Base", load_vlm),
     }
 
     if args.model == "all":
@@ -508,14 +488,17 @@ def main():
             )
             all_results[name] = result
 
-            # Graph-based static profiling
-            if args.graph_profile:
-                ctx_lens = [int(x) for x in args.context_lengths.split(",")]
-                family = "llm" if "gpt" in key else ("vit" if "vit" in key else "unknown")
+            # Graph analysis (export + profiling + compression plan)
+            if args.graph:
+                family = "llm" if "gpt" in key else (
+                    "vit" if "vit" in key else (
+                    "vlm" if "vlm" in key or "clip" in key else "unknown"))
                 graph_result = export_single_model(
                     model, sample_input, forward_fn,
                     model_name=name, model_family=family,
+                    save_graph=args.save_graph, output_dir=args.output_dir,
                 )
+                print(graph_result.summary())
                 if graph_result.success:
                     gsp = static_profiler.profile_from_graph(
                         model, graph_result,

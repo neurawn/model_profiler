@@ -128,6 +128,35 @@ def vit_input_fn(batch_size: int) -> torch.Tensor:
 
 
 # ════════════════════════════════════════════════════════════════
+# 4. VLM: CLIP
+# ════════════════════════════════════════════════════════════════
+
+def load_vlm(model_name: str = "openai/clip-vit-base-patch32") -> Tuple[nn.Module, torch.Tensor, Callable]:
+    """
+    Load CLIP (Vision-Language Model) from HuggingFace.
+
+    Returns:
+        (model, sample_input, forward_fn)
+    """
+    from transformers import CLIPModel
+
+    print(f"  Loading VLM ({model_name})...")
+    model = CLIPModel.from_pretrained(model_name, cache_dir=MODEL_DIR, token=HF_TOKEN)
+
+    # CLIP needs both image and text inputs
+    sample_input = torch.randn(1, 3, 224, 224)
+    dummy_input_ids = torch.randint(0, 49408, (1, 77))
+    dummy_attention_mask = torch.ones(1, 77, dtype=torch.long)
+
+    def forward_fn(m, x):
+        return m(pixel_values=x, input_ids=dummy_input_ids,
+                 attention_mask=dummy_attention_mask)
+
+    print(f"  ✓ VLM loaded ({sum(p.numel() for p in model.parameters()):,} params)")
+    return model, sample_input, forward_fn
+
+
+# ════════════════════════════════════════════════════════════════
 # UTILITY: Load all models
 # ════════════════════════════════════════════════════════════════
 
