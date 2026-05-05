@@ -448,15 +448,20 @@ def _load_arch_with_weights(arch: str, weight_path: str,
     """
     Instantiate a model architecture and load weights into it.
 
-    Returns (model, forward_fn).
+    Returns (model, forward_fn, sample_input).
+    sample_input is arch-appropriate (token IDs for LLMs, images for vision).
     """
     forward_fn = None
+    sample_input = None
 
     # GPT-2 family
     if arch in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
-        from transformers import GPT2LMHeadModel
+        from transformers import GPT2LMHeadModel, GPT2Tokenizer
         print(f"  Architecture: GPT2LMHeadModel ({arch})")
         model = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+        tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+        tokens = tokenizer("The quick brown fox jumps over the lazy dog", return_tensors="pt")
+        sample_input = tokens["input_ids"]
         forward_fn = lambda m, x: m(x, labels=x)
 
     # ViT family
@@ -464,13 +469,26 @@ def _load_arch_with_weights(arch: str, weight_path: str,
         from transformers import ViTForImageClassification
         print(f"  Architecture: ViTForImageClassification ({arch})")
         model = ViTForImageClassification.from_pretrained(arch, cache_dir=MODEL_DIR)
+        sample_input = torch.randn(1, 3, 224, 224)
         forward_fn = lambda m, x: m(pixel_values=x)
+
+    # CLIP / VLM
+    elif "clip" in arch.lower():
+        from transformers import CLIPModel
+        print(f"  Architecture: CLIPModel ({arch})")
+        model = CLIPModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+        sample_input = torch.randn(1, 3, 224, 224)
+        dummy_input_ids = torch.randint(0, 49408, (1, 77))
+        dummy_attention_mask = torch.ones(1, 77, dtype=torch.long)
+        forward_fn = lambda m, x: m(pixel_values=x, input_ids=dummy_input_ids,
+                                     attention_mask=dummy_attention_mask)
 
     # ResNet
     elif arch.lower() in ("resnet18", "resnet34", "resnet50", "resnet101", "resnet152"):
         import torchvision.models as tv_models
         print(f"  Architecture: {arch}")
         model = getattr(tv_models, arch.lower())(weights=None)
+        sample_input = torch.randn(1, 3, 224, 224)
 
     else:
         # Try as a HuggingFace model ID
@@ -506,7 +524,7 @@ def _load_arch_with_weights(arch: str, weight_path: str,
                   f"{len(missing)} missing, {len(unexpected)} unexpected")
 
     model.eval()
-    return model, forward_fn
+    return model, forward_fn, sample_input
 
 
 def main():
@@ -610,6 +628,7 @@ def main():
 
         local_model = None
         forward_fn = None
+        arch_sample = None
         is_safetensors = local_path.endswith(".safetensors") or _is_safetensors(local_path)
 
         if is_safetensors:
@@ -618,7 +637,7 @@ def main():
                 print("Error: safetensors file detected. Use --arch to specify the model "
                       "architecture (e.g. --arch gpt2, --arch google/vit-base-patch16-224)")
                 sys.exit(1)
-            local_model, forward_fn = _load_arch_with_weights(
+            local_model, forward_fn, arch_sample = _load_arch_with_weights(
                 args.arch, local_path, is_safetensors=True)
         else:
             try:
@@ -635,14 +654,18 @@ def main():
                     print("Error: file contains a state_dict. Use --arch to specify the model "
                           "architecture (e.g. --arch gpt2, --arch resnet18)")
                     sys.exit(1)
-                local_model, forward_fn = _load_arch_with_weights(
+                local_model, forward_fn, arch_sample = _load_arch_with_weights(
                     args.arch, local_path, state_dict=loaded)
             else:
                 print(f"Error: unexpected type in file: {type(loaded)}")
                 sys.exit(1)
 
         local_name = os.path.splitext(os.path.basename(local_path))[0]
-        sample_input = torch.randn(*input_shape)
+        # Use arch-specific sample input if available, otherwise generate from input_shape
+        if args.arch and arch_sample is not None:
+            sample_input = arch_sample
+        else:
+            sample_input = torch.randn(*input_shape)
         print(f"  Loaded {local_name} ({sum(p.numel() for p in local_model.parameters()):,} params)")
 
         all_results = {}
