@@ -582,8 +582,9 @@ class StaticProfiler:
 
     SPARSITY_THRESHOLD = 1e-6  # weights below this magnitude are "near-zero"
 
-    def __init__(self, sparsity_threshold: float = 1e-6):
+    def __init__(self, sparsity_threshold: float = 1e-6, compute_rank: bool = False):
         self.sparsity_threshold = sparsity_threshold
+        self.compute_rank = compute_rank  # SVD rank estimation is expensive; off by default
 
     def profile(self, model: nn.Module, model_name: str = "unknown") -> StaticProfile:
         """Run full static analysis on a model."""
@@ -696,12 +697,11 @@ class StaticProfiler:
 
         sparsity = float(np.mean(np.abs(flat) < self.sparsity_threshold))
 
-        # Rank estimate for 2D weight matrices
+        # Rank estimate for 2D weight matrices (opt-in: SVD is O(n³) and spawns BLAS threads)
         rank_estimate = None
-        if data.ndim == 2 and min(data.shape) > 1:
+        if self.compute_rank and data.ndim == 2 and min(data.shape) > 1:
             try:
                 sv = torch.linalg.svdvals(data)
-                # Effective rank: number of singular values > 1% of max
                 threshold = 0.01 * sv[0].item()
                 rank_estimate = int((sv > threshold).sum().item())
             except Exception:
@@ -1473,10 +1473,8 @@ class StaticProfiler:
         block_modules = []
         for name, module in model.named_modules():
             mtype = type(module).__name__
-            # Detect repeated blocks
             if any(k in mtype for k in ["Block", "Layer", "EncoderLayer",
                    "DecoderLayer", "ViTLayer", "GPT2Block", "CLIPEncoderLayer"]):
-                # Only direct blocks, not nested
                 parts = name.split(".")
                 try:
                     idx = int(parts[-1])
@@ -1487,30 +1485,33 @@ class StaticProfiler:
         if not block_modules:
             return []
 
+        # Pre-index node profiles by name prefix so per-block lookup is O(1)
+        # instead of scanning all nodes for every block.
+        from collections import defaultdict as _defaultdict
+        prefix_index: Dict[str, List[NodeProfile]] = _defaultdict(list)
+        for np_ in node_profiles:
+            # Index by every dot-separated prefix of the node name
+            parts = np_.name.split(".")
+            for i in range(1, len(parts) + 1):
+                prefix_index[".".join(parts[:i])].append(np_)
+
         blocks = []
         for bname, bidx, bmodule in block_modules:
             bp = BlockProfile(block_name=bname, block_index=bidx)
-
-            # Find nodes that belong to this block
-            block_param_names = {n for n, _ in bmodule.named_parameters()}
             op_counts = _Counter()
 
-            for np_ in node_profiles:
-                # Check if node name contains the block path
-                if bname in np_.name or any(
-                    np_.name.startswith(pn.rsplit(".", 1)[0])
-                    for pn in block_param_names if "." in pn
-                ):
-                    bp.total_flops += np_.flops
-                    bp.total_params += np_.params
-                    bp.total_activation_mb += np_.activation_memory_bytes / (1024 * 1024)
-                    bp.node_count += 1
-                    if np_.compressible:
-                        bp.compressible_count += 1
-                    op_counts[np_.op_type] += 1
+            # All nodes whose name starts with bname are in this block
+            matched = prefix_index.get(bname, [])
+            for np_ in matched:
+                bp.total_flops += np_.flops
+                bp.total_params += np_.params
+                bp.total_activation_mb += np_.activation_memory_bytes / (1024 * 1024)
+                bp.node_count += 1
+                if np_.compressible:
+                    bp.compressible_count += 1
+                op_counts[np_.op_type] += 1
 
             if not op_counts:
-                # Fallback: aggregate from module parameters directly
                 bp.total_params = sum(p.numel() for p in bmodule.parameters())
                 bp.total_flops = 2 * sum(
                     p.numel() for p in bmodule.parameters()
@@ -1520,8 +1521,8 @@ class StaticProfiler:
                                     if len(list(_.children())) == 0)
 
             bp.dominant_op = op_counts.most_common(1)[0][0] if op_counts else ""
-            intensities = [n.arithmetic_intensity for n in node_profiles
-                           if bname in n.name and n.arithmetic_intensity > 0
+            intensities = [n.arithmetic_intensity for n in matched
+                           if n.arithmetic_intensity > 0
                            and n.arithmetic_intensity != float('inf')]
             bp.avg_arithmetic_intensity = (
                 sum(intensities) / len(intensities) if intensities else 0.0

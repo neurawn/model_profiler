@@ -282,22 +282,25 @@ _KEYWORD_PATTERNS = [
 ]
 
 
+# Pre-built lowercase lookup to avoid per-node O(N) scan of COMPRESSIBLE_OPS
+_COMPRESSIBLE_OPS_LOWER: Dict[str, List[str]] = {k.lower(): v for k, v in COMPRESSIBLE_OPS.items()}
+
+
 def _classify_node_compressibility(node: GraphNode) -> Tuple[bool, List[str]]:
     """Check if a graph node represents a compressible operation."""
     target = node.target
-    target_lower = target.lower()
 
-    # Direct match on exact target name
+    # O(1) exact match
     if target in COMPRESSIBLE_OPS:
         return True, COMPRESSIBLE_OPS[target]
 
-    # Direct match on lowercased key
-    for key, methods in COMPRESSIBLE_OPS.items():
-        if key.lower() == target_lower:
-            return True, methods
+    # O(1) case-insensitive match via pre-built lowercase dict
+    target_lower = target.lower()
+    if target_lower in _COMPRESSIBLE_OPS_LOWER:
+        return True, _COMPRESSIBLE_OPS_LOWER[target_lower]
 
     # Keyword-based fallback: match substrings in the target or node name
-    combined = (target_lower + " " + node.name.lower())
+    combined = target_lower + " " + node.name.lower()
     for keywords, methods in _KEYWORD_PATTERNS:
         if any(kw in combined for kw in keywords):
             return True, methods
@@ -322,12 +325,13 @@ def _build_dependency_dag(graph, compressible_names: set) -> Tuple[List[DAGEdge]
 
     def _find_downstream_compressible(start_node, visited=None):
         """BFS to find reachable compressible nodes."""
+        from collections import deque
         if visited is None:
             visited = set()
         downstream = []
-        queue = list(start_node.users.keys())
+        queue = deque(start_node.users.keys())
         while queue:
-            user = queue.pop(0)
+            user = queue.popleft()  # O(1) vs list.pop(0) which is O(n)
             if user.name in visited:
                 continue
             visited.add(user.name)
