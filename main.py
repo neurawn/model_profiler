@@ -403,6 +403,8 @@ def compare_results(all_results):
     print("  Proposal predicts: Transformer > ViT > CNN")
     print("  ─────────────────────────────────────────────")
     for name, result in all_results.items():
+        if "static" not in result:
+            continue
         sp = result["static"]
         print(f"  {name:20s}  uniformity = {sp.param_uniformity_score:.4f}")
 
@@ -414,17 +416,20 @@ def save_results(all_results, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     for name, result in all_results.items():
+        if not result:
+            continue
         safe_name = name.lower().replace(" ", "_").replace("-", "_")
-        data = {
-            "static_profile": result["static"].to_dict(),
-        }
+        data = {}
+        if "static" in result:
+            data["static_profile"] = result["static"].to_dict()
         if "graph_profile" in result:
             data["graph_profile"] = result["graph_profile"].to_dict()
 
-        path = os.path.join(output_dir, f"{safe_name}_profile.json")
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        print(f"  Saved: {path}")
+        if data:
+            path = os.path.join(output_dir, f"{safe_name}_profile.json")
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2, default=str)
+            print(f"  Saved: {path}")
 
 
 def _is_safetensors(path: str) -> bool:
@@ -641,11 +646,15 @@ def main():
         print(f"  Loaded {local_name} ({sum(p.numel() for p in local_model.parameters()):,} params)")
 
         all_results = {}
-        result = profile_single_model(
-            local_name, local_model, sample_input, forward_fn,
-            static_profiler, target_device=args.target_device,
-        )
-        all_results[local_name] = result
+        run_static = not args.dynamic_profile or args.graph or args.quantize or args.apply_quantization
+        if run_static:
+            result = profile_single_model(
+                local_name, local_model, sample_input, forward_fn,
+                static_profiler, target_device=args.target_device,
+            )
+            all_results[local_name] = result
+        else:
+            all_results[local_name] = {}
 
         # Graph analysis (export + profiling + compression plan)
         if args.graph:
@@ -730,11 +739,15 @@ def main():
         name, loader = model_loaders[key]
         try:
             model, sample_input, forward_fn = loader()
-            result = profile_single_model(
-                name, model, sample_input, forward_fn,
-                static_profiler, target_device=args.target_device,
-            )
-            all_results[name] = result
+            run_static = not args.dynamic_profile or args.graph or args.quantize or args.apply_quantization
+            if run_static:
+                result = profile_single_model(
+                    name, model, sample_input, forward_fn,
+                    static_profiler, target_device=args.target_device,
+                )
+                all_results[name] = result
+            else:
+                all_results[name] = {}
 
             # Graph analysis (export + profiling + compression plan)
             if args.graph:
