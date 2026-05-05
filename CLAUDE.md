@@ -26,6 +26,7 @@ python main.py --model gpt2 --graph
 python main.py --model vit --graph
 python main.py --model vlm --graph
 python main.py --model gpt2 --graph --save-graph   # Also save graph files/CSVs
+python main.py --model gpt2 --graph --full-export  # Use torch.compile (CPU-intensive, GPU-accelerated)
 
 # ── Apply Plan-Based Mixed-Precision Quantization ──
 python main.py --model gpt2 --graph --apply-quantization
@@ -68,7 +69,7 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
   - `StaticProfiler.profile()` — weight-only analysis: parameter counts, layer types, depth.
   - `StaticProfiler.profile_from_graph()` — graph-based: per-node FLOPs/params/activation memory, arithmetic intensity, roofline placement, KV cache budget, per-block aggregation, and `CompressionPlan` (Pareto ranking, quant assignment, pruning candidates, token merging estimates, KV quant priority).
 
-- **`graph_export.py`** — Exports model graph via torch.export → torch.fx → torch.compile → module-walk fallback. Detects compressible ops, builds dependency DAG, saves operator CSVs and compressibility reports.
+- **`graph_export.py`** — Exports model graph via torch.export → torch.fx → module-walk fallback. `torch.compile` is available via `--full-export` but skipped by default (CPU-intensive, uses GPU if available). Detects compressible ops, builds dependency DAG, saves operator CSVs and compressibility reports.
 
 - **`quantize.py`** — Six quantization methods: `dynamic` (W8A8 dynamic), `static` (W8A8 calibrated), `float16`, `weight_int8`, `weight_int4`, `smoothquant` (W8A8 with activation smoothing). The `apply_quant_plan()` in main.py applies mixed-precision per-layer quantization from the compression plan.
 
@@ -87,3 +88,4 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
 - For local models: SafeTensors and state dicts require `--arch` to specify the model architecture. Full `nn.Module` `.pt` files load directly.
 - HuggingFace models cache to `./model/` via `HF_HOME` env var set in main.py.
 - GPT-2 uses HuggingFace `Conv1D` (not `nn.Linear`) — the profiler detects this automatically.
+- `--graph` defaults to fast module-walk (no torch.compile). Add `--full-export` for full torch.compile graph capture (uses GPU if available, but compiler is still CPU-bound).

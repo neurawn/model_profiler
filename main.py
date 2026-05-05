@@ -555,6 +555,10 @@ def main():
                              "and compression plan")
     parser.add_argument("--save-graph", action="store_true",
                         help="Save exported graphs and CSVs to output directory")
+    parser.add_argument("--full-export", action="store_true",
+                        help="Use torch.compile for graph export (CPU-intensive). "
+                             "By default, uses fast module-walk which gives same "
+                             "FLOPs/compression plan quality")
     parser.add_argument("--context-lengths", type=str, default="512,1024,2048,4096,8192",
                         help="Comma-separated context lengths for KV cache estimation")
     parser.add_argument("--apply-quantization", action="store_true",
@@ -639,6 +643,7 @@ def main():
                 local_model, sample_input, forward_fn,
                 model_name=local_name, model_family="local",
                 save_graph=args.save_graph, output_dir=args.output_dir,
+                full_export=args.full_export,
             )
             print(graph_result.summary())
             if graph_result.success:
@@ -721,6 +726,7 @@ def main():
                     model, sample_input, forward_fn,
                     model_name=name, model_family=family,
                     save_graph=args.save_graph, output_dir=args.output_dir,
+                    full_export=args.full_export,
                 )
                 print(graph_result.summary())
                 if graph_result.success:

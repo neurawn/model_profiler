@@ -579,7 +579,8 @@ def _export_model(model: nn.Module, sample_input,
                   model_name: str = "model",
                   model_family: str = "unknown",
                   save_graph: bool = False,
-                  output_dir: str = "./profiling_results") -> GraphExportResult:
+                  output_dir: str = "./profiling_results",
+                  full_export: bool = False) -> GraphExportResult:
     """
     Export a model using torch.export and analyze the graph.
 
@@ -629,7 +630,6 @@ def _export_model(model: nn.Module, sample_input,
         exported = torch.export.export(export_model, (inp,), strict=False)
     except Exception as e1:
         errors["torch.export"] = str(e1)
-        print(str(e1))
 
     # Method 2: torch.fx.symbolic_trace
     if exported is None:
@@ -637,10 +637,12 @@ def _export_model(model: nn.Module, sample_input,
             exported = torch.fx.symbolic_trace(export_model)
         except Exception as e2:
             errors["torch.fx"] = str(e2)
-            print(str(e2))
 
-    # Method 3: torch.compile with aot_eager backend to capture the graph
-    if exported is None:
+    # Method 3: torch.compile with custom backend to capture the graph
+    # Skipped by default — triggers Triton/inductor compilation which is
+    # CPU-intensive. Module-walk fallback gives same quality for FLOPs/
+    # compression plan. Use --full-export to enable.
+    if exported is None and full_export:
         try:
             captured_graphs = []
 
@@ -648,19 +650,26 @@ def _export_model(model: nn.Module, sample_input,
                 captured_graphs.append(gm)
                 return gm
 
-            compiled = torch.compile(export_model, backend=_capture_backend)
+            # Use GPU if available for faster forward pass during compilation
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compile_model = export_model.to(device)
+            compile_inp = inp.to(device) if isinstance(inp, torch.Tensor) else inp
+
+            compiled = torch.compile(compile_model, backend=_capture_backend)
             with torch.no_grad():
-                compiled(inp)
+                compiled(compile_inp)
 
             if captured_graphs:
                 exported = captured_graphs[0]
+
+            # Move back to CPU for analysis
+            export_model.cpu()
         except Exception as e3:
             errors["torch.compile"] = str(e3)
-            print(str(e3))
+            export_model.cpu()
 
     # Method 4: Manual module walk (always succeeds — no graph, but gives structure)
     if exported is None:
-        print("Manual walk: ", model_name, model_family)
         result.export_time_s = time.perf_counter() - t0
         result.success = True
 
