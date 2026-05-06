@@ -84,8 +84,6 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
 
 - **`dynamic_profile.py`** — Uses `torch.profiler` for runtime analysis: per-operator CPU/CUDA latency, memory allocation per op, tensor shapes, call stacks, FLOPs per op. Supports Chrome trace export (`--save-trace`) for visualization in `chrome://tracing`.
 
-- **`compression_recommender.py`** — Scores 8 compression methods (including token merging) using weighted feature matching. Currently not wired into the main pipeline.
-
 - **`models.py`** — Model loaders returning `(model, sample_input, forward_fn)` tuples for GPT-2 (all sizes), ResNet-18, ViT-Base, and CLIP. HuggingFace models download to local `./model/` directory.
 
 ## Key Patterns
