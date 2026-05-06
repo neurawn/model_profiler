@@ -30,16 +30,14 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 os.environ["HF_HOME"] = MODEL_DIR
 
 from static_profiler import StaticProfiler
-from compression_recommender import CompressionRecommender, recommend_for_model
 from models import (
     load_gpt2, load_resnet18, load_vit, load_vlm,
-    gpt2_input_fn, resnet_input_fn, vit_input_fn,
 )
 from token_merging import (
-    compare_strategies, apply_token_merging, TokenMergingProfiler,
+    compare_strategies, apply_token_merging,
 )
 from quantize import quantize_model
-from graph_export import run_graph_export, _export_model as export_single_model
+from graph_export import _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
 
 
