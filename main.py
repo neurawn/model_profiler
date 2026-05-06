@@ -18,8 +18,40 @@ import os
 import json
 import time
 import argparse
+from typing import Optional
 import torch
 import torch.nn as nn
+
+
+def _patch_linear_extra_repr():
+    """Compat shim for dynamic-quantized Linear pickles across torch versions.
+
+    Older torch bound `_linear_extra_repr` as a method on the dynamic
+    quantized Linear class; some pickled models reference it by name, so
+    `torch.load` fails with `'Linear' object has no attribute
+    '_linear_extra_repr'` on newer torch where the binding moved.
+    """
+    def _fallback(self):
+        try:
+            return (f"in_features={self.in_features}, "
+                    f"out_features={self.out_features}")
+        except AttributeError:
+            return ""
+
+    try:
+        from torch.ao.nn.quantized.dynamic.modules import linear as _qdl
+        if not hasattr(_qdl, "_linear_extra_repr"):
+            _qdl._linear_extra_repr = _fallback
+        if not hasattr(_qdl.Linear, "_linear_extra_repr"):
+            _qdl.Linear._linear_extra_repr = _fallback
+    except ImportError:
+        pass
+
+    if not hasattr(nn.Linear, "_linear_extra_repr"):
+        nn.Linear._linear_extra_repr = _fallback
+
+
+_patch_linear_extra_repr()
 
 # Add current dir to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +73,9 @@ from token_merging import (
 from quantize import quantize_model
 from graph_export import run_graph_export, _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
+from pruning import (
+    prune_model_2_4, print_prune_comparison, _convert_hf_conv1d_to_linear,
+)
 
 
 def apply_quant_plan(model, model_name, compression_plan, sample_input=None,
@@ -442,6 +477,126 @@ def _is_safetensors(path: str) -> bool:
         return False
 
 
+def _find_torchao_act_quant_scale(model: nn.Module):
+    """Find the first torchao Int8Tensor weight that carries an act_quant_scale.
+
+    Returns (module_name, scale_tensor, weight_shape) or (None, None, None).
+    Tries `module.weight`, `module.weight.data`, and the module's parameter
+    dict to deal with Parameter subclass-stripping in different torch versions.
+    """
+    for name, module in model.named_modules():
+        candidates = []
+        w = getattr(module, "weight", None)
+        if w is not None:
+            candidates.append(w)
+            d = getattr(w, "data", None)
+            if d is not None and d is not w:
+                candidates.append(d)
+        # Also look in the raw _parameters dict — some torchao paths store the
+        # subclassed tensor here without the Parameter wrapper losing attrs.
+        params = getattr(module, "_parameters", {}) or {}
+        if "weight" in params and params["weight"] is not None:
+            candidates.append(params["weight"])
+
+        for cand in candidates:
+            scale = getattr(cand, "act_quant_scale", None)
+            if scale is not None and hasattr(scale, "shape"):
+                return name, scale, tuple(getattr(cand, "shape", ()))
+    return None, None, None
+
+
+def _detect_torchao_calibrated_seq_len(model: nn.Module) -> Optional[int]:
+    """Per-token static activation quantization stores a scale of shape
+    (..., seq_len, 1). Pull it out of the first quantized weight we find.
+    """
+    name, scale, _ = _find_torchao_act_quant_scale(model)
+    if scale is None:
+        return None
+    shape = list(scale.shape)
+    if len(shape) >= 2 and shape[-1] == 1 and shape[-2] > 1:
+        return shape[-2]
+    if len(shape) == 1 and shape[0] > 1:
+        return shape[0]
+    return None
+
+
+def _strip_torchao_static_act_scales(model: nn.Module) -> int:
+    """Convert any torchao Int8 weights with static activation scales to use
+    dynamic activation quantization.
+
+    Static scales are tied to the calibration input shape (rank + seq_len),
+    which makes a saved model only runnable at that exact shape. Setting
+    `act_quant_scale` / `act_quant_zero_point` to None lets torchao compute
+    scales on the fly inside `Int8Tensor.from_hp`, which works for any input.
+    Returns the number of tensors stripped.
+    """
+    stripped = 0
+    seen = set()
+    for module in model.modules():
+        for cand in [getattr(module, "weight", None),
+                     getattr(getattr(module, "weight", None), "data", None),
+                     (getattr(module, "_parameters", {}) or {}).get("weight")]:
+            if cand is None or id(cand) in seen:
+                continue
+            seen.add(id(cand))
+            if getattr(cand, "act_quant_scale", None) is not None:
+                cand.act_quant_scale = None
+                if hasattr(cand, "act_quant_zero_point"):
+                    cand.act_quant_zero_point = None
+                stripped += 1
+    return stripped
+
+
+def _dump_torchao_quant_info(model: nn.Module) -> None:
+    """Print debug info about torchao activation quantization scales found."""
+    name, scale, weight_shape = _find_torchao_act_quant_scale(model)
+    if scale is None:
+        print("  [torchao] No static activation scales found on weights.")
+        return
+    print(f"  [torchao] Found static activation scale on '{name}':")
+    print(f"            weight shape = {weight_shape}")
+    print(f"            act_quant_scale shape = {tuple(scale.shape)}")
+    print(f"            (per-token scale ⇒ inputs must have seq_len matching "
+          f"shape[-2] of the scale)")
+
+
+def _arch_sample_and_forward(arch: str, seq_len: Optional[int] = None):
+    """Return an arch-appropriate (sample_input, forward_fn) without loading weights.
+
+    Shared by `_load_arch_with_weights` and the full-`nn.Module` load path so a
+    saved GPT-2 .pt loaded as a module still gets token-ID inputs (not floats,
+    which embedding layers reject).
+
+    `seq_len` overrides the default tokenized prompt length for LLMs — needed
+    when running torchao-quantized models whose activation scales are baked in
+    at a specific seq_len.
+    """
+    a = arch.lower()
+    if arch in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
+        if seq_len is not None:
+            # Random token IDs; vocab size for GPT-2 is 50257.
+            sample_input = torch.randint(0, 50257, (1, seq_len), dtype=torch.long)
+        else:
+            from transformers import GPT2Tokenizer
+            tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+            sample_input = tokenizer(
+                "The quick brown fox jumps over the lazy dog",
+                return_tensors="pt",
+            )["input_ids"]
+        return sample_input, lambda m, x: m(x, labels=x)
+    if "vit" in a:
+        return torch.randn(1, 3, 224, 224), lambda m, x: m(pixel_values=x)
+    if "clip" in a:
+        sample_input = torch.randn(1, 3, 224, 224)
+        dummy_ids = torch.randint(0, 49408, (1, 77))
+        dummy_mask = torch.ones(1, 77, dtype=torch.long)
+        return sample_input, lambda m, x: m(
+            pixel_values=x, input_ids=dummy_ids, attention_mask=dummy_mask)
+    if a in ("resnet18", "resnet34", "resnet50", "resnet101", "resnet152"):
+        return torch.randn(1, 3, 224, 224), None
+    return None, None
+
+
 def _load_arch_with_weights(arch: str, weight_path: str,
                             state_dict: dict = None,
                             is_safetensors: bool = False):
@@ -527,6 +682,72 @@ def _load_arch_with_weights(arch: str, weight_path: str,
     return model, forward_fn, sample_input
 
 
+def _profile_and_optionally_prune(model, sample_input, model_name, forward_fn,
+                                  args, output_dir):
+    """Wrap run_dynamic_profile. When --prune-2-4 is set, run profile twice
+    (before and after 2:4 pruning + sparse-tensor-core conversion) and print
+    a side-by-side comparison.
+    """
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not args.prune_2_4:
+        run_dynamic_profile(
+            model, sample_input, model_name=model_name, forward_fn=forward_fn,
+            device=device, num_runs=args.profile_runs,
+            save_trace=args.save_trace, output_dir=output_dir,
+        )
+        return
+
+    # 2:4 sparse tensor cores need fp16/bf16 weights on CUDA. Convert up front
+    # so the *before* profile uses the same dtype as *after* — otherwise we'd
+    # be conflating the dtype change with the pruning effect.
+    if device != "cuda":
+        print(f"  [prune-2-4] Requires CUDA; got device={device}. Skipping.")
+        run_dynamic_profile(
+            model, sample_input, model_name=model_name, forward_fn=forward_fn,
+            device=device, num_runs=args.profile_runs,
+            save_trace=args.save_trace, output_dir=output_dir,
+        )
+        return
+
+    print(f"\n  [prune-2-4] Casting model to fp16/CUDA for fair comparison...")
+    model = model.to(device="cuda", dtype=torch.float16)
+    if isinstance(sample_input, torch.Tensor) and sample_input.dtype.is_floating_point:
+        sample_input = sample_input.to(device="cuda", dtype=torch.float16)
+    elif isinstance(sample_input, torch.Tensor):
+        sample_input = sample_input.to(device="cuda")
+
+    # cuSPARSELt only handles sparse@dense, but HF Conv1D's forward is
+    # dense@sparse. Convert Conv1D → nn.Linear *before* the baseline run so
+    # both profiles use the same kernel layout — otherwise the comparison
+    # would conflate the layout switch with the sparsity gain.
+    n_conv = _convert_hf_conv1d_to_linear(model)
+    if n_conv:
+        print(f"  [prune-2-4] Converted {n_conv} HF Conv1D → nn.Linear")
+
+    print(f"\n{'#'*80}\n#  BEFORE 2:4 PRUNING\n{'#'*80}")
+    before = run_dynamic_profile(
+        model, sample_input, model_name=f"{model_name} (dense)",
+        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
+        save_trace=False, output_dir=output_dir,
+    )
+
+    print(f"\n{'#'*80}\n#  APPLYING 2:4 STRUCTURED PRUNING\n{'#'*80}")
+    prune_model_2_4(
+        model, convert_to_sparse=True, sparse_dtype=torch.float16,
+        calibration_input=sample_input, calibration_forward_fn=forward_fn,
+    )
+
+    print(f"\n{'#'*80}\n#  AFTER 2:4 PRUNING\n{'#'*80}")
+    after = run_dynamic_profile(
+        model, sample_input, model_name=f"{model_name} (2:4 sparse)",
+        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
+        save_trace=args.save_trace, output_dir=output_dir,
+    )
+
+    print_prune_comparison(before, after, device="cuda")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Model Profiler & Compression Recommender"
@@ -595,8 +816,18 @@ def main():
                         help="Device for dynamic profiling (cpu/cuda, auto-detected)")
     parser.add_argument("--save-trace", action="store_true",
                         help="Save Chrome trace JSON for visualization in chrome://tracing")
-    parser.add_argument("--profile-runs", type=int, default=5,
-                        help="Number of profiled forward passes (default: 5)")
+    parser.add_argument("--profile-runs", type=int, default=20,
+                        help="Number of profiled forward passes (default: 20)")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Override LLM input sequence length. Required when "
+                             "loading a torchao-quantized model whose activation "
+                             "scales were calibrated at a fixed seq_len.")
+    parser.add_argument("--prune-2-4", action="store_true",
+                        help="Apply 2:4 magnitude pruning to all eligible "
+                             "Linear/Conv1D layers and convert weights to "
+                             "SparseSemiStructuredTensor for cuSPARSELt "
+                             "acceleration on Ampere+ GPUs. Combine with "
+                             "--dynamic-profile to print a before/after table.")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -648,6 +879,29 @@ def main():
 
             if isinstance(loaded, nn.Module):
                 local_model = loaded
+                # A saved nn.Module already has weights, but we still need
+                # arch-appropriate sample input + forward_fn (e.g. token IDs
+                # for GPT-2). Derive them from --arch when provided.
+                if args.arch:
+                    seq_len = args.seq_len
+                    if seq_len is None:
+                        # torchao static-quant models bake activation scales at
+                        # a fixed seq_len; auto-detect to avoid shape asserts.
+                        seq_len = _detect_torchao_calibrated_seq_len(loaded)
+                        if seq_len is not None:
+                            print(f"  Detected torchao calibrated seq_len={seq_len}")
+                        else:
+                            _dump_torchao_quant_info(loaded)
+                    arch_sample, forward_fn = _arch_sample_and_forward(
+                        args.arch, seq_len=seq_len)
+                # Static activation scales also encode rank — they only work at
+                # the exact calibration shape. For dynamic profiling we want
+                # arbitrary inputs, so convert to dynamic activation quant.
+                if args.dynamic_profile:
+                    n = _strip_torchao_static_act_scales(loaded)
+                    if n:
+                        print(f"  Stripped static activation scales from {n} "
+                              f"torchao weight(s) (using dynamic act quant)")
             elif isinstance(loaded, dict):
                 # state_dict — requires --arch
                 if not args.arch:
@@ -728,13 +982,11 @@ def main():
                 output_dir=args.output_dir,
             )
 
-        # Dynamic profiling
+        # Dynamic profiling (+ optional 2:4 pruning before/after compare)
         if args.dynamic_profile:
-            run_dynamic_profile(
-                local_model, sample_input,
-                model_name=local_name, forward_fn=forward_fn,
-                device=args.device, num_runs=args.profile_runs,
-                save_trace=args.save_trace, output_dir=args.output_dir,
+            _profile_and_optionally_prune(
+                local_model, sample_input, local_name, forward_fn,
+                args, args.output_dir,
             )
 
         print("\n[Saving Results]")
@@ -836,13 +1088,11 @@ def main():
                     output_dir=args.output_dir,
                 )
 
-            # Dynamic profiling
+            # Dynamic profiling (+ optional 2:4 pruning before/after compare)
             if args.dynamic_profile:
-                run_dynamic_profile(
-                    model, sample_input,
-                    model_name=name, forward_fn=forward_fn,
-                    device=args.device, num_runs=args.profile_runs,
-                    save_trace=args.save_trace, output_dir=args.output_dir,
+                _profile_and_optionally_prune(
+                    model, sample_input, name, forward_fn,
+                    args, args.output_dir,
                 )
 
             # Free memory
