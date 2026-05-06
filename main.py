@@ -76,6 +76,7 @@ from dynamic_profile import run_dynamic_profile
 from pruning import (
     prune_model_2_4, print_prune_comparison, _convert_hf_conv1d_to_linear,
 )
+from perplexity import evaluate_perplexity, print_perplexity_table
 
 
 def apply_quant_plan(model, model_name, compression_plan, sample_input=None,
@@ -748,6 +749,128 @@ def _profile_and_optionally_prune(model, sample_input, model_name, forward_fn,
     print_prune_comparison(before, after, device="cuda")
 
 
+def _gpt2_arch_name(arch_or_model: Optional[str]) -> Optional[str]:
+    """Normalize --arch / --model to a HuggingFace GPT-2 checkpoint id, or None."""
+    if not arch_or_model:
+        return None
+    a = arch_or_model.lower()
+    if a in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
+        return a
+    return None
+
+
+def _evaluate_loaded_model_perplexity(model, args, label: str, notes: str = ""):
+    """Run WikiText-2 perplexity on an already-loaded GPT-2-family model.
+    Pulls tokenizer based on --arch / --model. Returns the PerplexityResult
+    or None if not a supported architecture.
+    """
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model)
+    if arch is None:
+        print("  [perplexity] Skipped: --perplexity currently supports GPT-2 "
+              "family only. Use --arch gpt2 or --model gpt2.")
+        return None
+    from transformers import GPT2Tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    return evaluate_perplexity(
+        model, tokenizer, label=label, device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes=notes,
+    )
+
+
+def run_perplexity_compare(args):
+    """Three-way WikiText-2 perplexity comparison:
+      1. base GPT-2 (FP32 reference)
+      2. plan-quantized checkpoint (mixed INT4/INT8/FP16)
+      3. plan-quantized + 2:4 magnitude pruning (mask-only, no fp16 cast)
+
+    The pruning step uses `convert_to_sparse=False` so the experiment
+    isolates the accuracy impact of zeroing 50% of weights from the
+    fp16 cast and cuSPARSELt conversion the perf flow does.
+    """
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model) or "gpt2"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = args.quantized_checkpoint
+
+    print(f"\n{'#'*80}")
+    print(f"#  WIKITEXT-2 PERPLEXITY COMPARISON")
+    print(f"#  arch={arch}  device={device}  max_length={args.ppl_max_length}  "
+          f"stride={args.ppl_stride}")
+    if args.ppl_max_tokens:
+        print(f"#  max_tokens={args.ppl_max_tokens:,} (truncated for speed)")
+    print(f"#  quantized checkpoint: {ckpt_path}")
+    print(f"{'#'*80}")
+
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+    rows = []
+
+    print(f"\n[1/3] Loading {arch} (FP32 baseline)...")
+    base = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+    rows.append(evaluate_perplexity(
+        base, tokenizer, label=f"{arch} (FP32 base)", device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes="reference",
+    ))
+    del base
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        print(f"\n[2/3] SKIPPED — checkpoint not found: {ckpt_path}")
+        print(f"[3/3] SKIPPED")
+        print_perplexity_table(rows)
+        return
+
+    print(f"\n[2/3] Loading plan-quantized checkpoint: {ckpt_path}")
+    loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if isinstance(loaded, dict) and "model_state_dict" in loaded:
+        sd = loaded["model_state_dict"]
+        avg_bits = loaded.get("avg_bits")
+    else:
+        sd = loaded
+        avg_bits = None
+    quant = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+    missing, unexpected = quant.load_state_dict(sd, strict=False)
+    # `_wq_scale` / `_wq_bits` buffers in the saved dict are diagnostic and
+    # land in `unexpected`; weights are pre-dequantized so the model is
+    # ready to evaluate as-is.
+    print(f"  Loaded (non-strict): {len(missing)} missing, "
+          f"{len(unexpected)} unexpected (expected: _wq_* buffers)")
+    quant_notes = "plan quant"
+    if avg_bits:
+        quant_notes += f", avg {avg_bits:.1f} bits"
+    rows.append(evaluate_perplexity(
+        quant, tokenizer, label=os.path.basename(ckpt_path), device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes=quant_notes,
+    ))
+
+    print(f"\n[3/3] Applying 2:4 magnitude pruning to plan-quantized model...")
+    # Move back to CPU so prune_model_2_4 can iterate weights without
+    # device-mixed comparisons; perplexity step will move it back.
+    quant.to("cpu")
+    prune_result = prune_model_2_4(
+        quant, convert_to_sparse=False, verbose=True,
+        calibration_input=None, calibration_forward_fn=None,
+    )
+    sparsity_pct = 100.0 * prune_result.sparsity
+    rows.append(evaluate_perplexity(
+        quant, tokenizer,
+        label=f"{os.path.basename(ckpt_path)} + 2:4",
+        device=device, max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens,
+        notes=f"{quant_notes} + 2:4 prune ({sparsity_pct:.1f}% zeros)",
+    ))
+    del quant
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    print_perplexity_table(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Model Profiler & Compression Recommender"
@@ -828,6 +951,27 @@ def main():
                              "SparseSemiStructuredTensor for cuSPARSELt "
                              "acceleration on Ampere+ GPUs. Combine with "
                              "--dynamic-profile to print a before/after table.")
+    parser.add_argument("--perplexity", action="store_true",
+                        help="Evaluate WikiText-2 perplexity on the loaded model "
+                             "(GPT-2 family only). Combine with --model gpt2 or "
+                             "--local <path> --arch gpt2.")
+    parser.add_argument("--perplexity-compare", action="store_true",
+                        help="Run a 3-way WikiText-2 perplexity comparison: "
+                             "base GPT-2, plan-quantized checkpoint (see "
+                             "--quantized-checkpoint), and that checkpoint with "
+                             "2:4 magnitude pruning applied. Prints a table.")
+    parser.add_argument("--quantized-checkpoint", type=str,
+                        default="./gpt_2_plan_quantized.pt",
+                        help="Path to a plan-quantized .pt produced by "
+                             "--apply-quantization. Used by --perplexity-compare.")
+    parser.add_argument("--ppl-max-length", type=int, default=1024,
+                        help="Sliding-window context length for perplexity "
+                             "(default: 1024 = GPT-2 ctx).")
+    parser.add_argument("--ppl-stride", type=int, default=512,
+                        help="Sliding-window stride for perplexity (default: 512).")
+    parser.add_argument("--ppl-max-tokens", type=int, default=None,
+                        help="Cap total tokens evaluated for perplexity. None = "
+                             "full WikiText-2 test split (~287K tokens).")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -838,6 +982,11 @@ def main():
     print("=" * 70)
 
     ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+
+    # Standalone perplexity comparison: handles all model loading itself.
+    if args.perplexity_compare:
+        run_perplexity_compare(args)
+        return
 
     # Initialize profiler
     static_profiler = StaticProfiler()
@@ -908,8 +1057,18 @@ def main():
                     print("Error: file contains a state_dict. Use --arch to specify the model "
                           "architecture (e.g. --arch gpt2, --arch resnet18)")
                     sys.exit(1)
+                # Saved checkpoints from this repo wrap the state dict under
+                # "model_state_dict" alongside metadata (e.g. plan_quantized,
+                # tome). Unwrap so load_state_dict sees real param keys.
+                sd = loaded
+                if "model_state_dict" in loaded and isinstance(
+                        loaded["model_state_dict"], dict):
+                    print(f"  Unwrapping checkpoint: state_dict under "
+                          f"'model_state_dict' key (other keys: "
+                          f"{[k for k in loaded if k != 'model_state_dict']})")
+                    sd = loaded["model_state_dict"]
                 local_model, forward_fn, arch_sample = _load_arch_with_weights(
-                    args.arch, local_path, state_dict=loaded)
+                    args.arch, local_path, state_dict=sd)
             else:
                 print(f"Error: unexpected type in file: {type(loaded)}")
                 sys.exit(1)
@@ -987,6 +1146,12 @@ def main():
             _profile_and_optionally_prune(
                 local_model, sample_input, local_name, forward_fn,
                 args, args.output_dir,
+            )
+
+        if args.perplexity:
+            _evaluate_loaded_model_perplexity(
+                local_model, args, label=local_name,
+                notes=f"loaded from {os.path.basename(local_path)}",
             )
 
         print("\n[Saving Results]")
@@ -1093,6 +1258,11 @@ def main():
                 _profile_and_optionally_prune(
                     model, sample_input, name, forward_fn,
                     args, args.output_dir,
+                )
+
+            if args.perplexity:
+                _evaluate_loaded_model_perplexity(
+                    model, args, label=name, notes="built-in model",
                 )
 
             # Free memory
