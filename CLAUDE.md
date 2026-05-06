@@ -45,11 +45,18 @@ python main.py --model vit --apply-tome                       # Apply and save m
 python main.py --model vit --apply-tome --merge-ratio 0.7     # Custom ratio
 python main.py --model vlm --apply-tome --merge-strategy kmeans
 
+# ── Dynamic Profiling (torch.profiler) ──
+python main.py --model gpt2 --dynamic-profile                 # CPU profiling
+python main.py --model gpt2 --dynamic-profile --device cuda   # GPU profiling
+python main.py --model gpt2 --dynamic-profile --save-trace    # Save Chrome trace
+python main.py --model gpt2 --dynamic-profile --profile-runs 10
+
 # ── Local Models (SafeTensors, state dicts, .pt files) ──
 python main.py --local ./small --arch gpt2
 python main.py --local ./small --arch gpt2 --graph --apply-quantization
 python main.py --local ./weights.pt --arch resnet18 --quantize weight_int4
 python main.py --local ./vit.safetensors --arch google/vit-base-patch16-224 --apply-tome
+python main.py --local ./small --arch gpt2 --dynamic-profile --device cuda
 
 # ── Custom Options ──
 python main.py --model gpt2 --graph --context-lengths 512,2048,16384
@@ -69,11 +76,13 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
   - `StaticProfiler.profile()` — weight-only analysis: parameter counts, layer types, depth.
   - `StaticProfiler.profile_from_graph()` — graph-based: per-node FLOPs/params/activation memory, arithmetic intensity, roofline placement, KV cache budget, per-block aggregation, and `CompressionPlan` (Pareto ranking, quant assignment, pruning candidates, token merging estimates, KV quant priority).
 
-- **`graph_export.py`** — Exports model graph via torch.export → torch.fx → module-walk fallback. `torch.compile` is available via `--full-export` but skipped by default (CPU-intensive, uses GPU if available). Detects compressible ops, builds dependency DAG, saves operator CSVs and compressibility reports.
+- **`graph_export.py`** — Exports model graph via torch.export → torch.fx → torch.compile → module-walk fallback. `torch.compile` is available via `--full-export` but skipped by default (CPU-intensive, uses GPU if available). Detects compressible ops, builds dependency DAG, saves operator CSVs and compressibility reports.
 
 - **`quantize.py`** — Six quantization methods: `dynamic` (W8A8 dynamic), `static` (W8A8 calibrated), `float16`, `weight_int8`, `weight_int4`, `smoothquant` (W8A8 with activation smoothing). The `apply_quant_plan()` in main.py applies mixed-precision per-layer quantization from the compression plan.
 
 - **`token_merging.py`** — Three token merging strategies for ViT/VLM: bipartite soft matching (ToMe), k-means clustering, average pooling. `TokenMergingWrapper` applies merging at inference via hooks. `TokenMergingProfiler` compares strategies.
+
+- **`dynamic_profile.py`** — Uses `torch.profiler` for runtime analysis: per-operator CPU/CUDA latency, memory allocation per op, tensor shapes, call stacks, FLOPs per op. Supports Chrome trace export (`--save-trace`) for visualization in `chrome://tracing`.
 
 - **`compression_recommender.py`** — Scores 8 compression methods (including token merging) using weighted feature matching. Currently not wired into the main pipeline.
 
@@ -85,6 +94,7 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
 - Profile results use dataclasses with `.to_dict()` for JSON serialization and `.summary()` for formatted console output.
 - `--graph` is the unified flag for graph export + graph-based profiling + compression plan. Add `--save-graph` to persist graph files.
 - `--apply-quantization` requires `--graph` (needs the compression plan). `--quantize` works standalone.
+- `--dynamic-profile` skips static profiling by default (runs only torch.profiler). Static profiling still runs if combined with `--graph`, `--quantize`, or `--apply-quantization`.
 - For local models: SafeTensors and state dicts require `--arch` to specify the model architecture. Full `nn.Module` `.pt` files load directly.
 - HuggingFace models cache to `./model/` via `HF_HOME` env var set in main.py.
 - GPT-2 uses HuggingFace `Conv1D` (not `nn.Linear`) — the profiler detects this automatically.
