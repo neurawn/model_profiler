@@ -22,6 +22,7 @@ import torch.quantization as tq
 import time
 import os
 import copy
+import pickle
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Tuple
 
@@ -620,13 +621,18 @@ def save_quantized_model(model: nn.Module, save_path: str,
     """Save a quantized model to disk."""
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
-    if method == "float16":
-        # float16 models can be saved normally
+    if method in ("float16", "smoothquant"):
+        # float16 and smoothquant models have hooks/closures that can't be
+        # pickled, so save state_dict instead
         torch.save(model.state_dict(), save_path)
     else:
         # INT8 quantized models: save the full model (not just state_dict)
         # because quantized modules have special structure
-        torch.save(model, save_path)
+        try:
+            torch.save(model, save_path)
+        except (AttributeError, pickle.PicklingError):
+            # Fallback to state_dict if full model can't be pickled
+            torch.save(model.state_dict(), save_path)
 
     size_mb = os.path.getsize(save_path) / (1024 * 1024)
     print(f"  Saved quantized model: {save_path} ({size_mb:.2f} MB)")
