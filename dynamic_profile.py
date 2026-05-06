@@ -164,7 +164,7 @@ def run_dynamic_profile(model: nn.Module, sample_input: torch.Tensor,
                         forward_fn: Optional[Callable] = None,
                         device: Optional[str] = None,
                         num_warmup: int = 3,
-                        num_runs: int = 5,
+                        num_runs: int = 20,
                         save_trace: bool = False,
                         output_dir: str = "./profiling_results",
                         ) -> DynamicProfileResult:
@@ -359,9 +359,12 @@ def run_dynamic_profile(model: nn.Module, sample_input: torch.Tensor,
 
 
 # Op kinds whose cost can be reduced by structured/unstructured pruning.
+# Includes sparse-dispatched variants (e.g. _sparse_semi_structured_linear)
+# so before/after-pruning comparisons capture the post-conversion op too.
 _PRUNABLE_OP_KEYWORDS = (
     "linear", "addmm", "matmul", "mm", "bmm",
     "conv1d", "conv2d", "conv3d", "convolution",
+    "sparse",
 )
 
 

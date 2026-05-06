@@ -18,8 +18,40 @@ import os
 import json
 import time
 import argparse
+from typing import Optional
 import torch
 import torch.nn as nn
+
+
+def _patch_linear_extra_repr():
+    """Compat shim for dynamic-quantized Linear pickles across torch versions.
+
+    Older torch bound `_linear_extra_repr` as a method on the dynamic
+    quantized Linear class; some pickled models reference it by name, so
+    `torch.load` fails with `'Linear' object has no attribute
+    '_linear_extra_repr'` on newer torch where the binding moved.
+    """
+    def _fallback(self):
+        try:
+            return (f"in_features={self.in_features}, "
+                    f"out_features={self.out_features}")
+        except AttributeError:
+            return ""
+
+    try:
+        from torch.ao.nn.quantized.dynamic.modules import linear as _qdl
+        if not hasattr(_qdl, "_linear_extra_repr"):
+            _qdl._linear_extra_repr = _fallback
+        if not hasattr(_qdl.Linear, "_linear_extra_repr"):
+            _qdl.Linear._linear_extra_repr = _fallback
+    except ImportError:
+        pass
+
+    if not hasattr(nn.Linear, "_linear_extra_repr"):
+        nn.Linear._linear_extra_repr = _fallback
+
+
+_patch_linear_extra_repr()
 
 # Add current dir to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +71,11 @@ from token_merging import (
 from quantize import quantize_model
 from graph_export import _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
+from pruning import (
+    prune_model_2_4, print_prune_comparison, _convert_hf_conv1d_to_linear,
+    save_pruned_model,
+)
+from perplexity import evaluate_perplexity, print_perplexity_table
 
 
 def apply_quant_plan(model, model_name, compression_plan, sample_input=None,
@@ -440,9 +477,183 @@ def _is_safetensors(path: str) -> bool:
         return False
 
 
+def _find_torchao_act_quant_scale(model: nn.Module):
+    """Find the first torchao Int8Tensor weight that carries an act_quant_scale.
+
+    Returns (module_name, scale_tensor, weight_shape) or (None, None, None).
+    Tries `module.weight`, `module.weight.data`, and the module's parameter
+    dict to deal with Parameter subclass-stripping in different torch versions.
+    """
+    for name, module in model.named_modules():
+        candidates = []
+        w = getattr(module, "weight", None)
+        if w is not None:
+            candidates.append(w)
+            d = getattr(w, "data", None)
+            if d is not None and d is not w:
+                candidates.append(d)
+        # Also look in the raw _parameters dict — some torchao paths store the
+        # subclassed tensor here without the Parameter wrapper losing attrs.
+        params = getattr(module, "_parameters", {}) or {}
+        if "weight" in params and params["weight"] is not None:
+            candidates.append(params["weight"])
+
+        for cand in candidates:
+            scale = getattr(cand, "act_quant_scale", None)
+            if scale is not None and hasattr(scale, "shape"):
+                return name, scale, tuple(getattr(cand, "shape", ()))
+    return None, None, None
+
+
+def _detect_torchao_calibrated_seq_len(model: nn.Module) -> Optional[int]:
+    """Per-token static activation quantization stores a scale of shape
+    (..., seq_len, 1). Pull it out of the first quantized weight we find.
+    """
+    name, scale, _ = _find_torchao_act_quant_scale(model)
+    if scale is None:
+        return None
+    shape = list(scale.shape)
+    if len(shape) >= 2 and shape[-1] == 1 and shape[-2] > 1:
+        return shape[-2]
+    if len(shape) == 1 and shape[0] > 1:
+        return shape[0]
+    return None
+
+
+def _strip_torchao_static_act_scales(model: nn.Module) -> int:
+    """Convert any torchao Int8 weights with static activation scales to use
+    dynamic activation quantization.
+
+    Static scales are tied to the calibration input shape (rank + seq_len),
+    which makes a saved model only runnable at that exact shape. Setting
+    `act_quant_scale` / `act_quant_zero_point` to None lets torchao compute
+    scales on the fly inside `Int8Tensor.from_hp`, which works for any input.
+    Returns the number of tensors stripped.
+    """
+    stripped = 0
+    seen = set()
+    for module in model.modules():
+        for cand in [getattr(module, "weight", None),
+                     getattr(getattr(module, "weight", None), "data", None),
+                     (getattr(module, "_parameters", {}) or {}).get("weight")]:
+            if cand is None or id(cand) in seen:
+                continue
+            seen.add(id(cand))
+            if getattr(cand, "act_quant_scale", None) is not None:
+                cand.act_quant_scale = None
+                if hasattr(cand, "act_quant_zero_point"):
+                    cand.act_quant_zero_point = None
+                stripped += 1
+    return stripped
+
+
+def _dump_torchao_quant_info(model: nn.Module) -> None:
+    """Print debug info about torchao activation quantization scales found."""
+    name, scale, weight_shape = _find_torchao_act_quant_scale(model)
+    if scale is None:
+        print("  [torchao] No static activation scales found on weights.")
+        return
+    print(f"  [torchao] Found static activation scale on '{name}':")
+    print(f"            weight shape = {weight_shape}")
+    print(f"            act_quant_scale shape = {tuple(scale.shape)}")
+    print(f"            (per-token scale ⇒ inputs must have seq_len matching "
+          f"shape[-2] of the scale)")
+
+
+def _arch_sample_and_forward(arch: str, seq_len: Optional[int] = None):
+    """Return an arch-appropriate (sample_input, forward_fn) without loading weights.
+
+    Shared by `_load_arch_with_weights` and the full-`nn.Module` load path so a
+    saved GPT-2 .pt loaded as a module still gets token-ID inputs (not floats,
+    which embedding layers reject).
+
+    `seq_len` overrides the default tokenized prompt length for LLMs — needed
+    when running torchao-quantized models whose activation scales are baked in
+    at a specific seq_len.
+    """
+    a = arch.lower()
+    if arch in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
+        if seq_len is not None:
+            # Random token IDs; vocab size for GPT-2 is 50257.
+            sample_input = torch.randint(0, 50257, (1, seq_len), dtype=torch.long)
+        else:
+            from transformers import GPT2Tokenizer
+            tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+            sample_input = tokenizer(
+                "The quick brown fox jumps over the lazy dog",
+                return_tensors="pt",
+            )["input_ids"]
+        return sample_input, lambda m, x: m(x, labels=x)
+    if "vit" in a:
+        return torch.randn(1, 3, 224, 224), lambda m, x: m(pixel_values=x)
+    if "clip" in a:
+        sample_input = torch.randn(1, 3, 224, 224)
+        dummy_ids = torch.randint(0, 49408, (1, 77))
+        dummy_mask = torch.ones(1, 77, dtype=torch.long)
+        return sample_input, lambda m, x: m(
+            pixel_values=x, input_ids=dummy_ids, attention_mask=dummy_mask)
+    if a in ("resnet18", "resnet34", "resnet50", "resnet101", "resnet152"):
+        return torch.randn(1, 3, 224, 224), None
+    return None, None
+
+
+def _restore_hf_conv1d_layout(state_dict, model, force_transpose_names=None):
+    """Transpose weights for any HF Conv1D module whose state_dict entry has
+    the nn.Linear (transposed) shape — undoes the layout swap done by
+    `_convert_hf_conv1d_to_linear` during the 2:4 prune flow.
+
+    Args:
+        state_dict: state dict (possibly with Linear-shaped weights for what
+            should be Conv1D modules in `model`).
+        model: destination module — Conv1D modules drive which keys to fix.
+        force_transpose_names: optional iterable of module names known to
+            have been Conv1D→Linear converted. Required for *square* Conv1D
+            modules (e.g. GPT-2's attn.c_proj is 768×768) where the shape
+            check can't tell whether the weight is already in the right
+            orientation; the explicit list lets us transpose them.
+
+    Returns a (shallow-copied) dict so the caller's state_dict isn't mutated.
+    No-op when there are no Conv1D modules or shapes already align.
+    """
+    try:
+        from transformers.pytorch_utils import Conv1D
+    except ImportError:
+        return state_dict
+
+    force_set = set(force_transpose_names or [])
+    fixed = dict(state_dict)
+    n_fixed = 0
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Conv1D):
+            continue
+        wkey = f"{name}.weight"
+        w = fixed.get(wkey)
+        if w is None or not hasattr(w, "shape"):
+            continue
+        target_shape = tuple(mod.weight.shape)
+        src_shape = tuple(w.shape)
+        if src_shape == target_shape:
+            # Shape already matches. For square Conv1D layers the saved
+            # weight may STILL be transposed (values, not shape) — that's
+            # the ambiguous case force_transpose_names exists for.
+            if (len(src_shape) == 2 and src_shape[0] == src_shape[1]
+                    and name in force_set):
+                fixed[wkey] = w.t().contiguous()
+                n_fixed += 1
+            continue
+        if len(src_shape) == 2 and src_shape == target_shape[::-1]:
+            fixed[wkey] = w.t().contiguous()
+            n_fixed += 1
+    if n_fixed:
+        print(f"  Restored HF Conv1D layout for {n_fixed} weight(s) "
+              f"(transposed from nn.Linear shape — saved by 2:4 prune flow)")
+    return fixed
+
+
 def _load_arch_with_weights(arch: str, weight_path: str,
                             state_dict: dict = None,
-                            is_safetensors: bool = False):
+                            is_safetensors: bool = False,
+                            force_transpose_names=None):
     """
     Instantiate a model architecture and load weights into it.
 
@@ -512,6 +723,13 @@ def _load_arch_with_weights(arch: str, weight_path: str,
         sd = None
 
     if sd is not None:
+        # The 2:4 prune flow replaces HF Conv1D modules with nn.Linear and
+        # transposes their weights. A fresh GPT-2 still has Conv1D modules,
+        # so any saved Linear-layout weights need to be transposed back to
+        # match. No-op when the shapes already align.
+        sd = _restore_hf_conv1d_layout(
+            sd, model, force_transpose_names=force_transpose_names)
+
         # Try strict load first, fall back to non-strict
         try:
             model.load_state_dict(sd, strict=True)
@@ -523,6 +741,202 @@ def _load_arch_with_weights(arch: str, weight_path: str,
 
     model.eval()
     return model, forward_fn, sample_input
+
+
+def _profile_and_optionally_prune(model, sample_input, model_name, forward_fn,
+                                  args, output_dir):
+    """Wrap run_dynamic_profile. When --prune-2-4 is set, run profile twice
+    (before and after 2:4 pruning + sparse-tensor-core conversion) and print
+    a side-by-side comparison.
+    """
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    if not args.prune_2_4:
+        run_dynamic_profile(
+            model, sample_input, model_name=model_name, forward_fn=forward_fn,
+            device=device, num_runs=args.profile_runs,
+            save_trace=args.save_trace, output_dir=output_dir,
+        )
+        return
+
+    # 2:4 sparse tensor cores need fp16/bf16 weights on CUDA. Convert up front
+    # so the *before* profile uses the same dtype as *after* — otherwise we'd
+    # be conflating the dtype change with the pruning effect.
+    if device != "cuda":
+        print(f"  [prune-2-4] Requires CUDA; got device={device}. Skipping.")
+        run_dynamic_profile(
+            model, sample_input, model_name=model_name, forward_fn=forward_fn,
+            device=device, num_runs=args.profile_runs,
+            save_trace=args.save_trace, output_dir=output_dir,
+        )
+        return
+
+    print(f"\n  [prune-2-4] Casting model to fp16/CUDA for fair comparison...")
+    model = model.to(device="cuda", dtype=torch.float16)
+    if isinstance(sample_input, torch.Tensor) and sample_input.dtype.is_floating_point:
+        sample_input = sample_input.to(device="cuda", dtype=torch.float16)
+    elif isinstance(sample_input, torch.Tensor):
+        sample_input = sample_input.to(device="cuda")
+
+    # cuSPARSELt only handles sparse@dense, but HF Conv1D's forward is
+    # dense@sparse. Convert Conv1D → nn.Linear *before* the baseline run so
+    # both profiles use the same kernel layout — otherwise the comparison
+    # would conflate the layout switch with the sparsity gain.
+    n_conv = _convert_hf_conv1d_to_linear(model)
+    if n_conv:
+        print(f"  [prune-2-4] Converted {n_conv} HF Conv1D → nn.Linear")
+
+    print(f"\n{'#'*80}\n#  BEFORE 2:4 PRUNING\n{'#'*80}")
+    before = run_dynamic_profile(
+        model, sample_input, model_name=f"{model_name} (dense)",
+        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
+        save_trace=False, output_dir=output_dir,
+    )
+
+    print(f"\n{'#'*80}\n#  APPLYING 2:4 STRUCTURED PRUNING\n{'#'*80}")
+    prune_result = prune_model_2_4(
+        model, convert_to_sparse=True, sparse_dtype=torch.float16,
+        calibration_input=sample_input, calibration_forward_fn=forward_fn,
+    )
+
+    if args.save_pruned is not None:
+        explicit_path = None if args.save_pruned == "auto" else args.save_pruned
+        save_pruned_model(
+            model, model_name, prune_result,
+            save_path=explicit_path, output_dir=output_dir,
+            sparse_dtype=torch.float16,
+        )
+
+    print(f"\n{'#'*80}\n#  AFTER 2:4 PRUNING\n{'#'*80}")
+    after = run_dynamic_profile(
+        model, sample_input, model_name=f"{model_name} (2:4 sparse)",
+        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
+        save_trace=args.save_trace, output_dir=output_dir,
+    )
+
+    print_prune_comparison(before, after, device="cuda")
+
+
+def _gpt2_arch_name(arch_or_model: Optional[str]) -> Optional[str]:
+    """Normalize --arch / --model to a HuggingFace GPT-2 checkpoint id, or None."""
+    if not arch_or_model:
+        return None
+    a = arch_or_model.lower()
+    if a in ("gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"):
+        return a
+    return None
+
+
+def _evaluate_loaded_model_perplexity(model, args, label: str, notes: str = ""):
+    """Run WikiText-2 perplexity on an already-loaded GPT-2-family model.
+    Pulls tokenizer based on --arch / --model. Returns the PerplexityResult
+    or None if not a supported architecture.
+    """
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model)
+    if arch is None:
+        print("  [perplexity] Skipped: --perplexity currently supports GPT-2 "
+              "family only. Use --arch gpt2 or --model gpt2.")
+        return None
+    from transformers import GPT2Tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    return evaluate_perplexity(
+        model, tokenizer, label=label, device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes=notes,
+    )
+
+
+def run_perplexity_compare(args):
+    """Three-way WikiText-2 perplexity comparison:
+      1. base GPT-2 (FP32 reference)
+      2. plan-quantized checkpoint (mixed INT4/INT8/FP16)
+      3. plan-quantized + 2:4 magnitude pruning (mask-only, no fp16 cast)
+
+    The pruning step uses `convert_to_sparse=False` so the experiment
+    isolates the accuracy impact of zeroing 50% of weights from the
+    fp16 cast and cuSPARSELt conversion the perf flow does.
+    """
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model) or "gpt2"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt_path = args.quantized_checkpoint
+
+    print(f"\n{'#'*80}")
+    print(f"#  WIKITEXT-2 PERPLEXITY COMPARISON")
+    print(f"#  arch={arch}  device={device}  max_length={args.ppl_max_length}  "
+          f"stride={args.ppl_stride}")
+    if args.ppl_max_tokens:
+        print(f"#  max_tokens={args.ppl_max_tokens:,} (truncated for speed)")
+    print(f"#  quantized checkpoint: {ckpt_path}")
+    print(f"{'#'*80}")
+
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+    rows = []
+
+    print(f"\n[1/3] Loading {arch} (FP32 baseline)...")
+    base = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+    rows.append(evaluate_perplexity(
+        base, tokenizer, label=f"{arch} (FP32 base)", device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes="reference",
+    ))
+    del base
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        print(f"\n[2/3] SKIPPED — checkpoint not found: {ckpt_path}")
+        print(f"[3/3] SKIPPED")
+        print_perplexity_table(rows)
+        return
+
+    print(f"\n[2/3] Loading plan-quantized checkpoint: {ckpt_path}")
+    loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if isinstance(loaded, dict) and "model_state_dict" in loaded:
+        sd = loaded["model_state_dict"]
+        avg_bits = loaded.get("avg_bits")
+    else:
+        sd = loaded
+        avg_bits = None
+    quant = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
+    missing, unexpected = quant.load_state_dict(sd, strict=False)
+    # `_wq_scale` / `_wq_bits` buffers in the saved dict are diagnostic and
+    # land in `unexpected`; weights are pre-dequantized so the model is
+    # ready to evaluate as-is.
+    print(f"  Loaded (non-strict): {len(missing)} missing, "
+          f"{len(unexpected)} unexpected (expected: _wq_* buffers)")
+    quant_notes = "plan quant"
+    if avg_bits:
+        quant_notes += f", avg {avg_bits:.1f} bits"
+    rows.append(evaluate_perplexity(
+        quant, tokenizer, label=os.path.basename(ckpt_path), device=device,
+        max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens, notes=quant_notes,
+    ))
+
+    print(f"\n[3/3] Applying 2:4 magnitude pruning to plan-quantized model...")
+    # Move back to CPU so prune_model_2_4 can iterate weights without
+    # device-mixed comparisons; perplexity step will move it back.
+    quant.to("cpu")
+    prune_result = prune_model_2_4(
+        quant, convert_to_sparse=False, verbose=True,
+        calibration_input=None, calibration_forward_fn=None,
+    )
+    sparsity_pct = 100.0 * prune_result.sparsity
+    rows.append(evaluate_perplexity(
+        quant, tokenizer,
+        label=f"{os.path.basename(ckpt_path)} + 2:4",
+        device=device, max_length=args.ppl_max_length, stride=args.ppl_stride,
+        max_tokens=args.ppl_max_tokens,
+        notes=f"{quant_notes} + 2:4 prune ({sparsity_pct:.1f}% zeros)",
+    ))
+    del quant
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    print_perplexity_table(rows)
 
 
 def main():
@@ -593,8 +1007,46 @@ def main():
                         help="Device for dynamic profiling (cpu/cuda, auto-detected)")
     parser.add_argument("--save-trace", action="store_true",
                         help="Save Chrome trace JSON for visualization in chrome://tracing")
-    parser.add_argument("--profile-runs", type=int, default=5,
-                        help="Number of profiled forward passes (default: 5)")
+    parser.add_argument("--profile-runs", type=int, default=20,
+                        help="Number of profiled forward passes (default: 20)")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="Override LLM input sequence length. Required when "
+                             "loading a torchao-quantized model whose activation "
+                             "scales were calibrated at a fixed seq_len.")
+    parser.add_argument("--prune-2-4", action="store_true",
+                        help="Apply 2:4 magnitude pruning to all eligible "
+                             "Linear/Conv1D layers and convert weights to "
+                             "SparseSemiStructuredTensor for cuSPARSELt "
+                             "acceleration on Ampere+ GPUs. Combine with "
+                             "--dynamic-profile to print a before/after table.")
+    parser.add_argument("--save-pruned", type=str, nargs="?", const="auto",
+                        default=None,
+                        help="Save the 2:4 pruned model. With no argument, "
+                             "writes to <output-dir>/<name>_pruned_2_4.pt. "
+                             "Pass an explicit path to override. Sparse-tensor "
+                             "weights are materialized to dense (2:4 zeros "
+                             "preserved) so the file loads portably.")
+    parser.add_argument("--perplexity", action="store_true",
+                        help="Evaluate WikiText-2 perplexity on the loaded model "
+                             "(GPT-2 family only). Combine with --model gpt2 or "
+                             "--local <path> --arch gpt2.")
+    parser.add_argument("--perplexity-compare", action="store_true",
+                        help="Run a 3-way WikiText-2 perplexity comparison: "
+                             "base GPT-2, plan-quantized checkpoint (see "
+                             "--quantized-checkpoint), and that checkpoint with "
+                             "2:4 magnitude pruning applied. Prints a table.")
+    parser.add_argument("--quantized-checkpoint", type=str,
+                        default="./gpt_2_plan_quantized.pt",
+                        help="Path to a plan-quantized .pt produced by "
+                             "--apply-quantization. Used by --perplexity-compare.")
+    parser.add_argument("--ppl-max-length", type=int, default=1024,
+                        help="Sliding-window context length for perplexity "
+                             "(default: 1024 = GPT-2 ctx).")
+    parser.add_argument("--ppl-stride", type=int, default=512,
+                        help="Sliding-window stride for perplexity (default: 512).")
+    parser.add_argument("--ppl-max-tokens", type=int, default=None,
+                        help="Cap total tokens evaluated for perplexity. None = "
+                             "full WikiText-2 test split (~287K tokens).")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -609,6 +1061,11 @@ def main():
         args.graph = True
 
     ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+
+    # Standalone perplexity comparison: handles all model loading itself.
+    if args.perplexity_compare:
+        run_perplexity_compare(args)
+        return
 
     # Initialize profiler
     static_profiler = StaticProfiler()
@@ -650,14 +1107,53 @@ def main():
 
             if isinstance(loaded, nn.Module):
                 local_model = loaded
+                # A saved nn.Module already has weights, but we still need
+                # arch-appropriate sample input + forward_fn (e.g. token IDs
+                # for GPT-2). Derive them from --arch when provided.
+                if args.arch:
+                    seq_len = args.seq_len
+                    if seq_len is None:
+                        # torchao static-quant models bake activation scales at
+                        # a fixed seq_len; auto-detect to avoid shape asserts.
+                        seq_len = _detect_torchao_calibrated_seq_len(loaded)
+                        if seq_len is not None:
+                            print(f"  Detected torchao calibrated seq_len={seq_len}")
+                        else:
+                            _dump_torchao_quant_info(loaded)
+                    arch_sample, forward_fn = _arch_sample_and_forward(
+                        args.arch, seq_len=seq_len)
+                # Static activation scales also encode rank — they only work at
+                # the exact calibration shape. For dynamic profiling we want
+                # arbitrary inputs, so convert to dynamic activation quant.
+                if args.dynamic_profile:
+                    n = _strip_torchao_static_act_scales(loaded)
+                    if n:
+                        print(f"  Stripped static activation scales from {n} "
+                              f"torchao weight(s) (using dynamic act quant)")
             elif isinstance(loaded, dict):
                 # state_dict — requires --arch
                 if not args.arch:
                     print("Error: file contains a state_dict. Use --arch to specify the model "
                           "architecture (e.g. --arch gpt2, --arch resnet18)")
                     sys.exit(1)
+                # Saved checkpoints from this repo wrap the state dict under
+                # "model_state_dict" alongside metadata (e.g. plan_quantized,
+                # tome, pruned). Unwrap so load_state_dict sees real param keys.
+                sd = loaded
+                pruned_names = None
+                if "model_state_dict" in loaded and isinstance(
+                        loaded["model_state_dict"], dict):
+                    print(f"  Unwrapping checkpoint: state_dict under "
+                          f"'model_state_dict' key (other keys: "
+                          f"{[k for k in loaded if k != 'model_state_dict']})")
+                    sd = loaded["model_state_dict"]
+                    # Pruned-2:4 checkpoints went through a Conv1D→Linear
+                    # transpose; thread the layer list to disambiguate
+                    # square Conv1D modules during layout restoration.
+                    pruned_names = loaded.get("pruned_layers")
                 local_model, forward_fn, arch_sample = _load_arch_with_weights(
-                    args.arch, local_path, state_dict=loaded)
+                    args.arch, local_path, state_dict=sd,
+                    force_transpose_names=pruned_names)
             else:
                 print(f"Error: unexpected type in file: {type(loaded)}")
                 sys.exit(1)
@@ -727,13 +1223,17 @@ def main():
                 output_dir=args.output_dir,
             )
 
-        # Dynamic profiling
+        # Dynamic profiling (+ optional 2:4 pruning before/after compare)
         if args.dynamic_profile:
-            run_dynamic_profile(
-                local_model, sample_input,
-                model_name=local_name, forward_fn=forward_fn,
-                device=args.device, num_runs=args.profile_runs,
-                save_trace=args.save_trace, output_dir=args.output_dir,
+            _profile_and_optionally_prune(
+                local_model, sample_input, local_name, forward_fn,
+                args, args.output_dir,
+            )
+
+        if args.perplexity:
+            _evaluate_loaded_model_perplexity(
+                local_model, args, label=local_name,
+                notes=f"loaded from {os.path.basename(local_path)}",
             )
 
         print("\n[Saving Results]")
@@ -835,13 +1335,16 @@ def main():
                     output_dir=args.output_dir,
                 )
 
-            # Dynamic profiling
+            # Dynamic profiling (+ optional 2:4 pruning before/after compare)
             if args.dynamic_profile:
-                run_dynamic_profile(
-                    model, sample_input,
-                    model_name=name, forward_fn=forward_fn,
-                    device=args.device, num_runs=args.profile_runs,
-                    save_trace=args.save_trace, output_dir=args.output_dir,
+                _profile_and_optionally_prune(
+                    model, sample_input, name, forward_fn,
+                    args, args.output_dir,
+                )
+
+            if args.perplexity:
+                _evaluate_loaded_model_perplexity(
+                    model, args, label=name, notes="built-in model",
                 )
 
             # Free memory
