@@ -15,6 +15,7 @@ few forward passes on representative input) is included to verify the pruned
 model produces sane output shapes/dtypes before profiling or saving.
 """
 
+import os
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
@@ -367,3 +368,82 @@ def print_prune_comparison(before, after, device: str = "cuda") -> None:
               f"{a_gf:>8.3f} {a_pct_f:>7.2f}% {a_tput:>8.2f} "
               f"{speedup:>8s}")
     print("=" * width)
+
+
+# ── Save / reload helpers ───────────────────────────────────────────────────
+
+def _materialize_sparse_state_dict(model: nn.Module):
+    """Return (state_dict, n_materialized) where SparseSemiStructuredTensor
+    weights are converted back to dense via `to_dense()`.
+
+    Saving the sparse subclass directly is fragile — pickle/load behavior
+    varies across torch versions. The 2:4 pattern is encoded as zeros in the
+    dense tensor, so a `to_dense()` round-trip preserves the sparsity and
+    lets the .pt load anywhere.
+    """
+    out = {}
+    n_materialized = 0
+    for k, v in model.state_dict().items():
+        is_sst = type(v).__name__.startswith("SparseSemiStructured")
+        if is_sst and hasattr(v, "to_dense"):
+            try:
+                out[k] = v.to_dense().detach().cpu().contiguous()
+                n_materialized += 1
+                continue
+            except Exception as e:
+                print(f"  [save_pruned] to_dense failed for {k}: {e}; "
+                      f"falling back to detach")
+        out[k] = v.detach().cpu() if hasattr(v, "detach") else v
+    return out, n_materialized
+
+
+def save_pruned_model(
+    model: nn.Module,
+    model_name: str,
+    prune_result: PruneResult,
+    save_path: Optional[str] = None,
+    output_dir: str = "./profiling_results",
+    sparse_dtype: Optional[torch.dtype] = None,
+) -> str:
+    """Save a 2:4 pruned model to disk.
+
+    Materializes any SparseSemiStructuredTensor weights to dense (the 2:4
+    zero pattern is preserved) so the file loads with a plain
+    `torch.load` + `model.load_state_dict` path on any torch version.
+    Saved as a wrapper dict with `model_state_dict` + metadata, matching
+    the format used by `apply_quant_plan`.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if not save_path:
+        safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
+        save_path = os.path.join(output_dir, f"{safe_name}_pruned_2_4.pt")
+
+    state_dict, n_materialized = _materialize_sparse_state_dict(model)
+
+    payload = {
+        "model_state_dict": state_dict,
+        "pruned_layers": list(prune_result.pruned_layers),
+        "converted_sparse": list(prune_result.converted_sparse),
+        "skipped_layers": list(prune_result.skipped_layers),
+        "total_zeros": prune_result.total_zeros,
+        "total_weights": prune_result.total_weights,
+        "achieved_sparsity": prune_result.sparsity,
+        "sparse_dtype": str(sparse_dtype) if sparse_dtype is not None else None,
+        "format": (
+            "2:4 magnitude-pruned dense weights (50% zeros in 2:4 pattern). "
+            "Re-engage cuSPARSELt by re-running --prune-2-4 on the loaded "
+            "model — the magnitude mask is a no-op since weights are already "
+            "2:4 sparse, and convert_to_sparse=True rebuilds the "
+            "SparseSemiStructuredTensor wrappers."
+        ),
+    }
+    torch.save(payload, save_path)
+    file_size = os.path.getsize(save_path) / (1024 * 1024)
+    print(f"\n  Saved pruned model: {save_path} ({file_size:.1f} MB)")
+    print(f"    Layers pruned:   {len(prune_result.pruned_layers)}")
+    print(f"    Sparsity:        {100.0 * prune_result.sparsity:.2f}%")
+    if n_materialized:
+        print(f"    Materialized:    {n_materialized} sparse-tensor weight(s) "
+              f"to dense (2:4 zeros preserved)")
+    print(f"    Reload:          --local {save_path} --arch <gpt2|...>")
+    return save_path

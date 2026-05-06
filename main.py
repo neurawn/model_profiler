@@ -75,6 +75,7 @@ from graph_export import run_graph_export, _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
 from pruning import (
     prune_model_2_4, print_prune_comparison, _convert_hf_conv1d_to_linear,
+    save_pruned_model,
 )
 from perplexity import evaluate_perplexity, print_perplexity_table
 
@@ -598,9 +599,63 @@ def _arch_sample_and_forward(arch: str, seq_len: Optional[int] = None):
     return None, None
 
 
+def _restore_hf_conv1d_layout(state_dict, model, force_transpose_names=None):
+    """Transpose weights for any HF Conv1D module whose state_dict entry has
+    the nn.Linear (transposed) shape — undoes the layout swap done by
+    `_convert_hf_conv1d_to_linear` during the 2:4 prune flow.
+
+    Args:
+        state_dict: state dict (possibly with Linear-shaped weights for what
+            should be Conv1D modules in `model`).
+        model: destination module — Conv1D modules drive which keys to fix.
+        force_transpose_names: optional iterable of module names known to
+            have been Conv1D→Linear converted. Required for *square* Conv1D
+            modules (e.g. GPT-2's attn.c_proj is 768×768) where the shape
+            check can't tell whether the weight is already in the right
+            orientation; the explicit list lets us transpose them.
+
+    Returns a (shallow-copied) dict so the caller's state_dict isn't mutated.
+    No-op when there are no Conv1D modules or shapes already align.
+    """
+    try:
+        from transformers.pytorch_utils import Conv1D
+    except ImportError:
+        return state_dict
+
+    force_set = set(force_transpose_names or [])
+    fixed = dict(state_dict)
+    n_fixed = 0
+    for name, mod in model.named_modules():
+        if not isinstance(mod, Conv1D):
+            continue
+        wkey = f"{name}.weight"
+        w = fixed.get(wkey)
+        if w is None or not hasattr(w, "shape"):
+            continue
+        target_shape = tuple(mod.weight.shape)
+        src_shape = tuple(w.shape)
+        if src_shape == target_shape:
+            # Shape already matches. For square Conv1D layers the saved
+            # weight may STILL be transposed (values, not shape) — that's
+            # the ambiguous case force_transpose_names exists for.
+            if (len(src_shape) == 2 and src_shape[0] == src_shape[1]
+                    and name in force_set):
+                fixed[wkey] = w.t().contiguous()
+                n_fixed += 1
+            continue
+        if len(src_shape) == 2 and src_shape == target_shape[::-1]:
+            fixed[wkey] = w.t().contiguous()
+            n_fixed += 1
+    if n_fixed:
+        print(f"  Restored HF Conv1D layout for {n_fixed} weight(s) "
+              f"(transposed from nn.Linear shape — saved by 2:4 prune flow)")
+    return fixed
+
+
 def _load_arch_with_weights(arch: str, weight_path: str,
                             state_dict: dict = None,
-                            is_safetensors: bool = False):
+                            is_safetensors: bool = False,
+                            force_transpose_names=None):
     """
     Instantiate a model architecture and load weights into it.
 
@@ -670,6 +725,13 @@ def _load_arch_with_weights(arch: str, weight_path: str,
         sd = None
 
     if sd is not None:
+        # The 2:4 prune flow replaces HF Conv1D modules with nn.Linear and
+        # transposes their weights. A fresh GPT-2 still has Conv1D modules,
+        # so any saved Linear-layout weights need to be transposed back to
+        # match. No-op when the shapes already align.
+        sd = _restore_hf_conv1d_layout(
+            sd, model, force_transpose_names=force_transpose_names)
+
         # Try strict load first, fall back to non-strict
         try:
             model.load_state_dict(sd, strict=True)
@@ -734,10 +796,18 @@ def _profile_and_optionally_prune(model, sample_input, model_name, forward_fn,
     )
 
     print(f"\n{'#'*80}\n#  APPLYING 2:4 STRUCTURED PRUNING\n{'#'*80}")
-    prune_model_2_4(
+    prune_result = prune_model_2_4(
         model, convert_to_sparse=True, sparse_dtype=torch.float16,
         calibration_input=sample_input, calibration_forward_fn=forward_fn,
     )
+
+    if args.save_pruned is not None:
+        explicit_path = None if args.save_pruned == "auto" else args.save_pruned
+        save_pruned_model(
+            model, model_name, prune_result,
+            save_path=explicit_path, output_dir=output_dir,
+            sparse_dtype=torch.float16,
+        )
 
     print(f"\n{'#'*80}\n#  AFTER 2:4 PRUNING\n{'#'*80}")
     after = run_dynamic_profile(
@@ -951,6 +1021,13 @@ def main():
                              "SparseSemiStructuredTensor for cuSPARSELt "
                              "acceleration on Ampere+ GPUs. Combine with "
                              "--dynamic-profile to print a before/after table.")
+    parser.add_argument("--save-pruned", type=str, nargs="?", const="auto",
+                        default=None,
+                        help="Save the 2:4 pruned model. With no argument, "
+                             "writes to <output-dir>/<name>_pruned_2_4.pt. "
+                             "Pass an explicit path to override. Sparse-tensor "
+                             "weights are materialized to dense (2:4 zeros "
+                             "preserved) so the file loads portably.")
     parser.add_argument("--perplexity", action="store_true",
                         help="Evaluate WikiText-2 perplexity on the loaded model "
                              "(GPT-2 family only). Combine with --model gpt2 or "
@@ -1059,16 +1136,22 @@ def main():
                     sys.exit(1)
                 # Saved checkpoints from this repo wrap the state dict under
                 # "model_state_dict" alongside metadata (e.g. plan_quantized,
-                # tome). Unwrap so load_state_dict sees real param keys.
+                # tome, pruned). Unwrap so load_state_dict sees real param keys.
                 sd = loaded
+                pruned_names = None
                 if "model_state_dict" in loaded and isinstance(
                         loaded["model_state_dict"], dict):
                     print(f"  Unwrapping checkpoint: state_dict under "
                           f"'model_state_dict' key (other keys: "
                           f"{[k for k in loaded if k != 'model_state_dict']})")
                     sd = loaded["model_state_dict"]
+                    # Pruned-2:4 checkpoints went through a Conv1D→Linear
+                    # transpose; thread the layer list to disambiguate
+                    # square Conv1D modules during layout restoration.
+                    pruned_names = loaded.get("pruned_layers")
                 local_model, forward_fn, arch_sample = _load_arch_with_weights(
-                    args.arch, local_path, state_dict=sd)
+                    args.arch, local_path, state_dict=sd,
+                    force_transpose_names=pruned_names)
             else:
                 print(f"Error: unexpected type in file: {type(loaded)}")
                 sys.exit(1)
