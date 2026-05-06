@@ -28,6 +28,8 @@ class OpProfile:
     input_shapes: List[str]
     cpu_time_us: float
     cuda_time_us: float
+    self_cpu_time_us: float  # excludes time in nested ops — matches profiler "Self" cols
+    self_cuda_time_us: float
     cpu_memory_usage: int  # bytes allocated
     cuda_memory_usage: int
     call_stack: str
@@ -260,15 +262,28 @@ def run_dynamic_profile(model: nn.Module, sample_input: torch.Tensor,
     op_profiles = []
     op_type_agg = {}  # op_name -> {count, cpu_time, cuda_time, memory}
 
-    key_averages = prof.key_averages(group_by_stack_n=5)
+    # group_by_stack_n=0 → one row per op kind (matches torch.profiler's
+    # table view, so Self CUDA % lines up with addmm = 50.71% etc.).
+    key_averages = prof.key_averages(group_by_stack_n=0)
 
     total_cpu = 0.0
     total_cuda = 0.0
     total_flops = 0
 
     for evt in key_averages:
-        cpu_time = evt.cpu_time_total  # microseconds
-        cuda_time = evt.cuda_time_total if hasattr(evt, 'cuda_time_total') else 0
+        cpu_time = evt.cpu_time_total  # microseconds, includes child ops
+        self_cpu_time = getattr(evt, 'self_cpu_time_total', cpu_time)
+        # PyTorch 2.4+ renamed cuda_time_total → device_time_total. Try the new
+        # name first, fall back to the legacy attribute for older builds.
+        if hasattr(evt, 'device_time_total'):
+            cuda_time = evt.device_time_total
+            self_cuda_time = getattr(evt, 'self_device_time_total', cuda_time)
+        elif hasattr(evt, 'cuda_time_total'):
+            cuda_time = evt.cuda_time_total
+            self_cuda_time = getattr(evt, 'self_cuda_time_total', cuda_time)
+        else:
+            cuda_time = 0
+            self_cuda_time = 0
         cpu_mem = evt.cpu_memory_usage if hasattr(evt, 'cpu_memory_usage') else 0
         cuda_mem = evt.cuda_memory_usage if hasattr(evt, 'cuda_memory_usage') else 0
         flops = evt.flops if hasattr(evt, 'flops') and evt.flops else 0
@@ -290,6 +305,8 @@ def run_dynamic_profile(model: nn.Module, sample_input: torch.Tensor,
             input_shapes=shapes,
             cpu_time_us=cpu_time,
             cuda_time_us=cuda_time,
+            self_cpu_time_us=self_cpu_time,
+            self_cuda_time_us=self_cuda_time,
             cpu_memory_usage=cpu_mem,
             cuda_memory_usage=cuda_mem,
             call_stack=stack,
@@ -333,4 +350,68 @@ def run_dynamic_profile(model: nn.Module, sample_input: torch.Tensor,
         sort_by=sort_key, row_limit=20,
     ))
 
+    # Pruning targets: rank compressible ops by cost on the active device.
+    # Pass the same key_averages used by .table() above so % time matches the
+    # profiler's "Self CUDA %" column exactly.
+    _print_pruning_targets(op_profiles, device, prof.key_averages(group_by_stack_n=0))
+
     return result
+
+
+# Op kinds whose cost can be reduced by structured/unstructured pruning.
+_PRUNABLE_OP_KEYWORDS = (
+    "linear", "addmm", "matmul", "mm", "bmm",
+    "conv1d", "conv2d", "conv3d", "convolution",
+)
+
+
+def _print_pruning_targets(op_profiles: List[OpProfile], device: str,
+                           key_averages, top_k: int = 10) -> None:
+    """Pick the top ops to prune, ranked by per-op cost on the active device.
+
+    The denominator for `% time` is computed from `key_averages` the same way
+    torch.profiler's table does, so the percentages match its `Self CUDA %` /
+    `Self CPU %` columns exactly.
+    """
+    if not op_profiles:
+        return
+
+    use_cuda = device == "cuda"
+    cost = lambda op: op.self_cuda_time_us if use_cuda else op.self_cpu_time_us
+    label = "Self CUDA us" if use_cuda else "Self CPU us"
+
+    # Replicate torch.profiler's denominator: sum of self device/cpu time over
+    # the same key_averages it uses to build the table.
+    def _self_time(evt):
+        if use_cuda:
+            return getattr(evt, 'self_device_time_total',
+                           getattr(evt, 'self_cuda_time_total', 0)) or 0
+        return getattr(evt, 'self_cpu_time_total', 0) or 0
+
+    total_time = sum(_self_time(evt) for evt in key_averages) or 1.0
+    total_flops = sum(getattr(evt, 'flops', 0) or 0 for evt in key_averages) or 1.0
+
+    candidates = [
+        op for op in op_profiles
+        if any(k in op.name.lower() for k in _PRUNABLE_OP_KEYWORDS) and cost(op) > 0
+    ]
+    if not candidates:
+        return
+    candidates.sort(key=lambda op: -cost(op))
+
+    print()
+    print(f"  Pruning targets (top {min(top_k, len(candidates))} by {label}):")
+    print(f"  {'Op':<32s} {label:>14s} {'% time':>8s} "
+          f"{'GFLOPs':>10s} {'% flops':>8s} {'Shapes'}")
+    print(f"  {'─'*32} {'─'*14} {'─'*8} {'─'*10} {'─'*8} {'─'*24}")
+    for op in candidates[:top_k]:
+        time_pct = 100.0 * cost(op) / total_time
+        flops_pct = 100.0 * op.flops / total_flops if op.flops else 0.0
+        gflops = op.flops / 1e9 if op.flops else 0.0
+        shapes_str = ", ".join(op.input_shapes[:2])
+        if len(op.input_shapes) > 2:
+            shapes_str += f" +{len(op.input_shapes)-2}"
+        print(
+            f"  {op.name[:32]:<32s} {cost(op):>14.0f} "
+            f"{time_pct:>7.2f}% {gflops:>10.3f} {flops_pct:>7.2f}% {shapes_str}"
+        )
