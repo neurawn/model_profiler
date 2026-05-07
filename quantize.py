@@ -22,7 +22,6 @@ import torch.quantization as tq
 import time
 import os
 import copy
-import pickle
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Tuple
 
@@ -408,6 +407,46 @@ def quantize_weight_only(model: nn.Module, model_name: str = "model",
     return quantized, result
 
 
+def _convert_conv1d_to_linear(model: nn.Module) -> Tuple[nn.Module, int]:
+    """
+    Convert HuggingFace Conv1D layers to nn.Linear in-place.
+
+    HuggingFace GPT-2 uses Conv1D (which is functionally a linear layer
+    with transposed weight) instead of nn.Linear. torchao's SmoothQuant
+    only operates on nn.Linear, so we convert first.
+
+    Conv1D weight shape: (in_features, out_features) — transposed vs Linear
+    nn.Linear weight shape: (out_features, in_features)
+
+    Returns:
+        (model, count) — the modified model and number of layers converted.
+    """
+    try:
+        from transformers.pytorch_utils import Conv1D as HFConv1D
+    except ImportError:
+        return model, 0
+
+    converted = 0
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if isinstance(child, HFConv1D):
+                # Conv1D stores weight as (in_features, out_features)
+                in_features = child.weight.shape[0]
+                out_features = child.weight.shape[1]
+
+                linear = nn.Linear(in_features, out_features,
+                                   bias=child.bias is not None)
+                # Transpose weight: Conv1D (in, out) -> Linear (out, in)
+                linear.weight = nn.Parameter(child.weight.data.t().contiguous())
+                if child.bias is not None:
+                    linear.bias = child.bias
+
+                setattr(module, child_name, linear)
+                converted += 1
+
+    return model, converted
+
+
 def quantize_smoothquant(model: nn.Module, model_name: str = "model",
                          sample_input: Optional[torch.Tensor] = None,
                          forward_fn: Optional[Callable] = None,
@@ -416,29 +455,26 @@ def quantize_smoothquant(model: nn.Module, model_name: str = "model",
                          benchmark: bool = True,
                          ) -> Tuple[nn.Module, QuantizationResult]:
     """
-    Apply SmoothQuant (Xiao et al., 2023) for W8A8 quantization.
+    Apply SmoothQuant (Xiao et al., 2023) for W8A8 quantization using
+    torchao's official implementation.
 
-    SmoothQuant smooths activation outliers by migrating quantization
-    difficulty from activations to weights using a per-channel scaling
-    factor s_j = max(|X_j|)^alpha / max(|W_j|)^(1-alpha).
-
-    The transform is mathematically equivalent:
-        Y = (X diag(s)^-1) @ (diag(s) W) = X @ W
-
-    After smoothing, both weights and activations become easier to
-    quantize to INT8 with minimal accuracy loss.
+    Uses torchao.prototype.smoothquant with Int8DynamicActivationInt8WeightConfig.
+    Automatically converts HuggingFace Conv1D to nn.Linear before quantizing.
 
     Args:
         model: PyTorch model to quantize.
         model_name: Name for display.
         sample_input: Calibration input (required).
         forward_fn: Custom forward function.
-        alpha: Migration strength (0-1). Higher = more smoothing on activations.
-               0.5 is the default from the paper. Use 0.75 for models with
-               large activation outliers (e.g. OPT, BLOOM).
+        alpha: Migration strength (0-1). 0.5 is default from the paper.
         n_calibration: Number of calibration forward passes.
         benchmark: Whether to measure latency.
     """
+    from torchao.prototype.smoothquant import SmoothQuantConfig
+    from torchao.quantization import quantize_
+    from torchao.quantization.quant_api import Int8StaticActivationInt8WeightConfig
+    from torchao.quantization.quantize_.common.quantization_step import QuantizationStep
+
     if sample_input is None:
         raise ValueError("SmoothQuant requires sample_input for calibration")
 
@@ -454,111 +490,41 @@ def quantize_smoothquant(model: nn.Module, model_name: str = "model",
 
     quantized = copy.deepcopy(model)
     quantized.eval()
+
+    # Convert Conv1D to nn.Linear (GPT-2 uses Conv1D)
+    quantized, conv1d_count = _convert_conv1d_to_linear(quantized)
+    if conv1d_count > 0:
+        print(f"  [SmoothQuant] Converted {conv1d_count} Conv1D layers to nn.Linear")
+
+    # Count Linear layers before quantization
+    linear_count = sum(1 for m in quantized.modules() if isinstance(m, nn.Linear))
+    print(f"  [SmoothQuant] {linear_count} Linear layers to quantize (alpha={alpha})")
+
     fwd = forward_fn if forward_fn else lambda m, x: m(x)
 
-    # ── Step 1: Collect activation statistics via hooks ──
-    act_scales = {}  # module_name -> max per-channel activation magnitude
-    handles = []
+    # Step 1: Prepare — insert SmoothQuant observers
+    print(f"  [SmoothQuant] Step 1: Inserting observers...")
+    prepare_config = SmoothQuantConfig(
+        base_config=Int8StaticActivationInt8WeightConfig(),
+        step=QuantizationStep.PREPARE,
+        alpha=alpha,
+    )
+    quantize_(quantized, prepare_config)
 
-    def _make_hook(name):
-        def hook(module, input, output):
-            if isinstance(input, tuple) and len(input) > 0:
-                x = input[0]
-            else:
-                x = input
-            if isinstance(x, torch.Tensor) and x.ndim >= 2:
-                # Per-channel max absolute value (last dim = features)
-                x_abs_max = x.abs().amax(dim=list(range(x.ndim - 1)))
-                if name in act_scales:
-                    act_scales[name] = torch.max(act_scales[name], x_abs_max)
-                else:
-                    act_scales[name] = x_abs_max.clone()
-        return hook
-
-    # Register hooks on Linear layers
-    linear_modules = {}
-    for name, module in quantized.named_modules():
-        if isinstance(module, nn.Linear):
-            handles.append(module.register_forward_hook(_make_hook(name)))
-            linear_modules[name] = module
-
-    # Run calibration
-    print(f"  [SmoothQuant] Calibrating with {n_calibration} passes (alpha={alpha})...")
+    # Step 2: Calibrate — run forward passes to collect activation stats
+    print(f"  [SmoothQuant] Step 2: Calibrating with {n_calibration} passes...")
     with torch.no_grad():
         for _ in range(n_calibration):
             fwd(quantized, sample_cpu)
 
-    # Remove hooks
-    for h in handles:
-        h.remove()
-
-    # ── Step 2: Compute smoothing scales and apply ──
-    smoothed_count = 0
-    for name, module in linear_modules.items():
-        if name not in act_scales:
-            continue
-
-        x_scale = act_scales[name].clamp(min=1e-8)
-        w = module.weight.data.float()
-        # Per-input-channel weight max: max over output dim
-        w_scale = w.abs().amax(dim=0).clamp(min=1e-8)
-
-        # s_j = x_scale^alpha / w_scale^(1-alpha)
-        s = (x_scale.pow(alpha) / w_scale.pow(1 - alpha)).clamp(min=1e-8)
-
-        # Apply smoothing: W_new = W @ diag(s), so activations get divided by s
-        # Equivalent: scale weights by s per input channel
-        module.weight.data = w * s.unsqueeze(0)
-
-        # If there's a preceding LayerNorm/bias, absorb the inverse scaling
-        # For now, store the scale as a buffer for the activation transform
-        module.register_buffer("_smooth_scale", s)
-        smoothed_count += 1
-
-    print(f"  [SmoothQuant] Smoothed {smoothed_count} Linear layers")
-
-    # ── Step 3: Quantize weights to INT8 (per-tensor symmetric) ──
-    quantized_count = 0
-    for name, module in quantized.named_modules():
-        if isinstance(module, nn.Linear):
-            w = module.weight.data.float()
-            w_max = w.abs().max().clamp(min=1e-8)
-            scale = w_max / 127.0
-            w_int = torch.clamp(torch.round(w / scale), -128, 127)
-            module.weight.data = w_int * scale
-            module.register_buffer("_wq_scale", scale)
-            module.register_buffer("_wq_bits", torch.tensor(8))
-            quantized_count += 1
-
-    # ── Step 4: Wrap forward to quantize activations at runtime ──
-    # Install pre-hooks that quantize input activations to INT8
-    act_hooks = []
-    for name, module in quantized.named_modules():
-        if isinstance(module, nn.Linear) and hasattr(module, '_smooth_scale'):
-            def _make_act_quant_hook(mod):
-                def hook(module, input):
-                    if isinstance(input, tuple):
-                        x = input[0]
-                        rest = input[1:]
-                    else:
-                        x = input
-                        rest = ()
-                    if isinstance(x, torch.Tensor) and x.ndim >= 2:
-                        # Divide by smooth scale (absorb into activation)
-                        s = mod._smooth_scale.to(x.device)
-                        x = x / s.unsqueeze(0).expand_as(x) if x.ndim == 2 else x / s
-
-                        # Quantize activation to INT8
-                        x_max = x.abs().max().clamp(min=1e-8)
-                        a_scale = x_max / 127.0
-                        x_int = torch.clamp(torch.round(x / a_scale), -128, 127)
-                        x = x_int * a_scale
-
-                    return (x,) + rest if rest else (x,)
-                return hook
-            act_hooks.append(
-                module.register_forward_pre_hook(_make_act_quant_hook(module))
-            )
+    # Step 3: Convert — apply smoothing + quantize weights
+    print(f"  [SmoothQuant] Step 3: Converting to quantized model...")
+    convert_config = SmoothQuantConfig(
+        base_config=Int8StaticActivationInt8WeightConfig(),
+        step=QuantizationStep.CONVERT,
+        alpha=alpha,
+    )
+    quantize_(quantized, convert_config)
 
     quantized_size = _model_size_mb(quantized)
 
@@ -582,7 +548,7 @@ def quantize_smoothquant(model: nn.Module, model_name: str = "model",
         original_latency_ms=original_latency,
         quantized_latency_ms=quantized_latency,
         speedup=speedup,
-        quantized_layers=quantized_count,
+        quantized_layers=linear_count,
         total_layers=total_layers,
     )
 
@@ -621,18 +587,15 @@ def save_quantized_model(model: nn.Module, save_path: str,
     """Save a quantized model to disk."""
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
-    if method in ("float16", "smoothquant"):
-        # float16 and smoothquant models have hooks/closures that can't be
-        # pickled, so save state_dict instead
-        torch.save(model.state_dict(), save_path)
-    else:
-        # INT8 quantized models: save the full model (not just state_dict)
-        # because quantized modules have special structure
-        try:
-            torch.save(model, save_path)
-        except (AttributeError, pickle.PicklingError):
-            # Fallback to state_dict if full model can't be pickled
-            torch.save(model.state_dict(), save_path)
+    # Try saving full model first, fall back to state_dict if pickle fails
+    try:
+        torch.save(model, save_path)
+    except Exception:
+        save_data = {
+            "model_state_dict": model.state_dict(),
+            "quantization_method": method,
+        }
+        torch.save(save_data, save_path)
 
     size_mb = os.path.getsize(save_path) / (1024 * 1024)
     print(f"  Saved quantized model: {save_path} ({size_mb:.2f} MB)")

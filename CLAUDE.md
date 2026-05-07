@@ -29,8 +29,8 @@ python main.py --model gpt2 --graph --save-graph   # Also save graph files/CSVs
 python main.py --model gpt2 --graph --full-export  # Use torch.compile (CPU-intensive, GPU-accelerated)
 
 # ── Apply Plan-Based Mixed-Precision Quantization ──
-python main.py --model gpt2 --graph --apply-quantization
-python main.py --model vit --graph --apply-quantization
+python main.py --model gpt2 --quantize-suggested
+python main.py --model vit --quantize-suggested
 
 # ── Uniform Quantization ──
 python main.py --model gpt2 --quantize weight_int8
@@ -66,7 +66,7 @@ python main.py --model gpt2 --perplexity --ppl-max-tokens 5000        # Truncate
 
 # ── Local Models (SafeTensors, state dicts, .pt files) ──
 python main.py --local ./small --arch gpt2
-python main.py --local ./small --arch gpt2 --graph --apply-quantization
+python main.py --local ./small --arch gpt2 --quantize-suggested
 python main.py --local ./weights.pt --arch resnet18 --quantize weight_int4
 python main.py --local ./vit.safetensors --arch google/vit-base-patch16-224 --apply-tome
 python main.py --local ./small --arch gpt2 --dynamic-profile --device cuda
@@ -114,8 +114,8 @@ The pipeline flows: **models.py** (load) → **static_profiler.py** (analyze wei
 - Each model loader returns a 3-tuple `(model, sample_input, forward_fn)` — `forward_fn` is `None` for standard models, a callable for HuggingFace models.
 - Profile results use dataclasses with `.to_dict()` for JSON serialization and `.summary()` for formatted console output.
 - `--graph` is the unified flag for graph export + graph-based profiling + compression plan. Add `--save-graph` to persist graph files.
-- `--apply-quantization` requires `--graph` (needs the compression plan). `--quantize` works standalone.
-- `--dynamic-profile` skips static profiling by default (runs only torch.profiler). Static profiling still runs if combined with `--graph`, `--quantize`, or `--apply-quantization`.
+- `--quantize-suggested` auto-enables `--graph` (runs graph analysis, then applies the plan's per-layer quantization). `--quantize` works standalone.
+- `--dynamic-profile` skips static profiling by default (runs only torch.profiler). Static profiling still runs if combined with `--graph`, `--quantize`, or `--quantize-suggested`.
 - For local models: SafeTensors and state dicts require `--arch` to specify the model architecture. Full `nn.Module` `.pt` files load directly.
 - HuggingFace models cache to `./model/` via `HF_HOME` env var set in main.py.
 - GPT-2 uses HuggingFace `Conv1D` (not `nn.Linear`) — the profiler detects this automatically.

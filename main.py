@@ -62,16 +62,14 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 os.environ["HF_HOME"] = MODEL_DIR
 
 from static_profiler import StaticProfiler
-from compression_recommender import CompressionRecommender, recommend_for_model
 from models import (
     load_gpt2, load_resnet18, load_vit, load_vlm,
-    gpt2_input_fn, resnet_input_fn, vit_input_fn,
 )
 from token_merging import (
-    compare_strategies, apply_token_merging, TokenMergingProfiler,
+    compare_strategies, apply_token_merging,
 )
 from quantize import quantize_model
-from graph_export import run_graph_export, _export_model as export_single_model
+from graph_export import _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
 from perplexity import evaluate_perplexity, print_perplexity_table
 
@@ -1073,9 +1071,9 @@ def main():
                              "FLOPs/compression plan quality")
     parser.add_argument("--context-lengths", type=str, default="512,1024,2048,4096,8192",
                         help="Comma-separated context lengths for KV cache estimation")
-    parser.add_argument("--apply-quantization", action="store_true",
-                        help="Apply the compression plan's per-layer quantization assignment "
-                             "from --graph and save the mixed-precision quantized model")
+    parser.add_argument("--quantize-suggested", action="store_true",
+                        help="Run graph analysis, then apply the compression plan's "
+                             "per-layer mixed-precision quantization and save the model")
     parser.add_argument("--dynamic-profile", action="store_true",
                         help="Run torch.profiler dynamic profiling: per-op latency, "
                              "memory usage, tensor shapes, call stacks, FLOPs")
@@ -1154,6 +1152,10 @@ def main():
     print("=" * 70)
     print(f"  Target: {args.target_device}")
     print("=" * 70)
+
+    # --quantize-suggested implies --graph
+    if args.quantize_suggested:
+        args.graph = True
 
     ctx_lens = [int(x) for x in args.context_lengths.split(",")]
 
@@ -1274,7 +1276,7 @@ def main():
         print(f"  Loaded {local_name} ({sum(p.numel() for p in local_model.parameters()):,} params)")
 
         all_results = {}
-        run_static = not args.dynamic_profile or args.graph or args.quantize or args.apply_quantization
+        run_static = not args.dynamic_profile or args.graph or args.quantize or args.quantize_suggested
         if run_static:
             result = profile_single_model(
                 local_name, local_model, sample_input, forward_fn,
@@ -1303,15 +1305,12 @@ def main():
                 all_results[local_name]["graph_profile"] = gsp
 
                 # Apply plan-based quantization
-                if args.apply_quantization and gsp.compression_plan:
+                if args.quantize_suggested and gsp.compression_plan:
                     apply_quant_plan(
                         local_model, local_name, gsp.compression_plan,
                         sample_input=sample_input, forward_fn=forward_fn,
                         output_dir=args.output_dir,
                     )
-
-        if args.apply_quantization and not args.graph:
-            print("Error: --apply-quantization requires --graph to generate the compression plan first")
 
         # Quantize if requested
         if args.quantize:
@@ -1381,7 +1380,7 @@ def main():
         name, loader = model_loaders[key]
         try:
             model, sample_input, forward_fn = loader()
-            run_static = not args.dynamic_profile or args.graph or args.quantize or args.apply_quantization
+            run_static = not args.dynamic_profile or args.graph or args.quantize or args.quantize_suggested
             if run_static:
                 result = profile_single_model(
                     name, model, sample_input, forward_fn,
@@ -1413,7 +1412,7 @@ def main():
                     all_results[name]["graph_profile"] = gsp
 
                     # Apply plan-based quantization
-                    if args.apply_quantization and gsp.compression_plan:
+                    if args.quantize_suggested and gsp.compression_plan:
                         apply_quant_plan(
                             model, name, gsp.compression_plan,
                             sample_input=sample_input, forward_fn=forward_fn,
