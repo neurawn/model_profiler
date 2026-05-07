@@ -71,10 +71,6 @@ from token_merging import (
 from quantize import quantize_model
 from graph_export import _export_model as export_single_model
 from dynamic_profile import run_dynamic_profile
-from pruning import (
-    prune_model_2_4, print_prune_comparison, _convert_hf_conv1d_to_linear,
-    save_pruned_model,
-)
 from perplexity import evaluate_perplexity, print_perplexity_table
 
 
@@ -600,7 +596,7 @@ def _arch_sample_and_forward(arch: str, seq_len: Optional[int] = None):
 def _restore_hf_conv1d_layout(state_dict, model, force_transpose_names=None):
     """Transpose weights for any HF Conv1D module whose state_dict entry has
     the nn.Linear (transposed) shape — undoes the layout swap done by
-    `_convert_hf_conv1d_to_linear` during the 2:4 prune flow.
+    `_convert_hf_conv1d_to_linear` during the SparseGPT 2:4 conversion.
 
     Args:
         state_dict: state dict (possibly with Linear-shaped weights for what
@@ -743,80 +739,6 @@ def _load_arch_with_weights(arch: str, weight_path: str,
     return model, forward_fn, sample_input
 
 
-def _profile_and_optionally_prune(model, sample_input, model_name, forward_fn,
-                                  args, output_dir):
-    """Wrap run_dynamic_profile. When --prune-2-4 is set, run profile twice
-    (before and after 2:4 pruning + sparse-tensor-core conversion) and print
-    a side-by-side comparison.
-    """
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    if not args.prune_2_4:
-        run_dynamic_profile(
-            model, sample_input, model_name=model_name, forward_fn=forward_fn,
-            device=device, num_runs=args.profile_runs,
-            save_trace=args.save_trace, output_dir=output_dir,
-        )
-        return
-
-    # 2:4 sparse tensor cores need fp16/bf16 weights on CUDA. Convert up front
-    # so the *before* profile uses the same dtype as *after* — otherwise we'd
-    # be conflating the dtype change with the pruning effect.
-    if device != "cuda":
-        print(f"  [prune-2-4] Requires CUDA; got device={device}. Skipping.")
-        run_dynamic_profile(
-            model, sample_input, model_name=model_name, forward_fn=forward_fn,
-            device=device, num_runs=args.profile_runs,
-            save_trace=args.save_trace, output_dir=output_dir,
-        )
-        return
-
-    print(f"\n  [prune-2-4] Casting model to fp16/CUDA for fair comparison...")
-    model = model.to(device="cuda", dtype=torch.float16)
-    if isinstance(sample_input, torch.Tensor) and sample_input.dtype.is_floating_point:
-        sample_input = sample_input.to(device="cuda", dtype=torch.float16)
-    elif isinstance(sample_input, torch.Tensor):
-        sample_input = sample_input.to(device="cuda")
-
-    # cuSPARSELt only handles sparse@dense, but HF Conv1D's forward is
-    # dense@sparse. Convert Conv1D → nn.Linear *before* the baseline run so
-    # both profiles use the same kernel layout — otherwise the comparison
-    # would conflate the layout switch with the sparsity gain.
-    n_conv = _convert_hf_conv1d_to_linear(model)
-    if n_conv:
-        print(f"  [prune-2-4] Converted {n_conv} HF Conv1D → nn.Linear")
-
-    print(f"\n{'#'*80}\n#  BEFORE 2:4 PRUNING\n{'#'*80}")
-    before = run_dynamic_profile(
-        model, sample_input, model_name=f"{model_name} (dense)",
-        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
-        save_trace=False, output_dir=output_dir,
-    )
-
-    print(f"\n{'#'*80}\n#  APPLYING 2:4 STRUCTURED PRUNING\n{'#'*80}")
-    prune_result = prune_model_2_4(
-        model, convert_to_sparse=True, sparse_dtype=torch.float16,
-        calibration_input=sample_input, calibration_forward_fn=forward_fn,
-    )
-
-    if args.save_pruned is not None:
-        explicit_path = None if args.save_pruned == "auto" else args.save_pruned
-        save_pruned_model(
-            model, model_name, prune_result,
-            save_path=explicit_path, output_dir=output_dir,
-            sparse_dtype=torch.float16,
-        )
-
-    print(f"\n{'#'*80}\n#  AFTER 2:4 PRUNING\n{'#'*80}")
-    after = run_dynamic_profile(
-        model, sample_input, model_name=f"{model_name} (2:4 sparse)",
-        forward_fn=forward_fn, device="cuda", num_runs=args.profile_runs,
-        save_trace=args.save_trace, output_dir=output_dir,
-    )
-
-    print_prune_comparison(before, after, device="cuda")
-
-
 def _gpt2_arch_name(arch_or_model: Optional[str]) -> Optional[str]:
     """Normalize --arch / --model to a HuggingFace GPT-2 checkpoint id, or None."""
     if not arch_or_model:
@@ -848,14 +770,12 @@ def _evaluate_loaded_model_perplexity(model, args, label: str, notes: str = ""):
 
 
 def run_perplexity_compare(args):
-    """Three-way WikiText-2 perplexity comparison:
+    """Two-way WikiText-2 perplexity comparison:
       1. base GPT-2 (FP32 reference)
       2. plan-quantized checkpoint (mixed INT4/INT8/FP16)
-      3. plan-quantized + 2:4 magnitude pruning (mask-only, no fp16 cast)
 
-    The pruning step uses `convert_to_sparse=False` so the experiment
-    isolates the accuracy impact of zeroing 50% of weights from the
-    fp16 cast and cuSPARSELt conversion the perf flow does.
+    For pruning comparisons, run --prune-sparsegpt --save-pruned to produce
+    a pruned checkpoint, then `--compare-perplexity --local <each path>`.
     """
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
@@ -875,7 +795,7 @@ def run_perplexity_compare(args):
     tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
     rows = []
 
-    print(f"\n[1/3] Loading {arch} (FP32 baseline)...")
+    print(f"\n[1/2] Loading {arch} (FP32 baseline)...")
     base = GPT2LMHeadModel.from_pretrained(arch, cache_dir=MODEL_DIR)
     rows.append(evaluate_perplexity(
         base, tokenizer, label=f"{arch} (FP32 base)", device=device,
@@ -887,12 +807,11 @@ def run_perplexity_compare(args):
         torch.cuda.empty_cache()
 
     if not ckpt_path or not os.path.isfile(ckpt_path):
-        print(f"\n[2/3] SKIPPED — checkpoint not found: {ckpt_path}")
-        print(f"[3/3] SKIPPED")
+        print(f"\n[2/2] SKIPPED — checkpoint not found: {ckpt_path}")
         print_perplexity_table(rows)
         return
 
-    print(f"\n[2/3] Loading plan-quantized checkpoint: {ckpt_path}")
+    print(f"\n[2/2] Loading plan-quantized checkpoint: {ckpt_path}")
     loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(loaded, dict) and "model_state_dict" in loaded:
         sd = loaded["model_state_dict"]
@@ -915,26 +834,179 @@ def run_perplexity_compare(args):
         max_length=args.ppl_max_length, stride=args.ppl_stride,
         max_tokens=args.ppl_max_tokens, notes=quant_notes,
     ))
-
-    print(f"\n[3/3] Applying 2:4 magnitude pruning to plan-quantized model...")
-    # Move back to CPU so prune_model_2_4 can iterate weights without
-    # device-mixed comparisons; perplexity step will move it back.
-    quant.to("cpu")
-    prune_result = prune_model_2_4(
-        quant, convert_to_sparse=False, verbose=True,
-        calibration_input=None, calibration_forward_fn=None,
-    )
-    sparsity_pct = 100.0 * prune_result.sparsity
-    rows.append(evaluate_perplexity(
-        quant, tokenizer,
-        label=f"{os.path.basename(ckpt_path)} + 2:4",
-        device=device, max_length=args.ppl_max_length, stride=args.ppl_stride,
-        max_tokens=args.ppl_max_tokens,
-        notes=f"{quant_notes} + 2:4 prune ({sparsity_pct:.1f}% zeros)",
-    ))
     del quant
     if device == "cuda":
         torch.cuda.empty_cache()
+
+    print_perplexity_table(rows)
+
+
+def run_prune(model, model_name, args, output_dir):
+    """Drive a SparseGPT pruning pass on a loaded GPT-2 model.
+
+    Loads WikiText-2 calibration via the active GPT-2 tokenizer, runs the
+    block-by-block algorithm in `sparsegpt.py`, and (if --save-pruned was
+    given) persists the result to disk.
+    """
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model)
+    if arch is None:
+        print("Error: --prune requires the GPT-2 family. "
+              "Use --arch gpt2|gpt2-medium|gpt2-large|gpt2-xl.")
+        sys.exit(1)
+
+    from transformers import GPT2Tokenizer
+    from sparsegpt import (
+        load_wikitext_calibration, prune_gpt2_sparsegpt, save_sparsegpt_model,
+    )
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    pattern = args.prune
+    sparsity = 0.5 if pattern == "2:4" else args.prune_sparsity
+
+    print(f"\n{'#'*80}")
+    print(f"#  SPARSEGPT PRUNING: {model_name}")
+    print(f"#  pattern={pattern}  target_sparsity={sparsity:.2f}  "
+          f"device={device}")
+    print(f"#  calibration: WikiText-2 train, "
+          f"{args.prune_samples} samples × {args.prune_seqlen} tokens")
+    print(f"{'#'*80}")
+
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+    calib = load_wikitext_calibration(
+        tokenizer,
+        n_samples=args.prune_samples,
+        seqlen=args.prune_seqlen,
+    )
+
+    # 2:4 + CUDA → also wrap as SparseSemiStructuredTensor for tensor-core
+    # speedup. Anything else stays dense (the zeros are still in place; just
+    # no kernel acceleration).
+    convert_to_sparse = (pattern == "2:4" and device == "cuda")
+
+    result = prune_gpt2_sparsegpt(
+        model, calib,
+        pattern=pattern, sparsity=sparsity,
+        device=device,
+        convert_to_sparse=convert_to_sparse,
+        sparse_dtype=torch.float16,
+    )
+
+    if args.save_pruned is not None:
+        explicit = None if args.save_pruned == "auto" else args.save_pruned
+        save_sparsegpt_model(
+            model, model_name, result,
+            save_path=explicit, output_dir=output_dir,
+            sparse_dtype=torch.float16 if convert_to_sparse else None,
+        )
+
+    return result
+
+
+def _load_local_for_perplexity(path: str, arch: str):
+    """Load a local checkpoint into a fresh `arch` model for perplexity eval.
+
+    Handles three layouts: safetensors, full nn.Module pickle, and state_dict
+    (including the wrapper-dict produced by --apply-quantization and the 2:4
+    pruning save flow). Returns the ready-to-eval model.
+    """
+    is_safetensors = path.endswith(".safetensors") or _is_safetensors(path)
+    if is_safetensors:
+        if not arch:
+            raise ValueError("--arch is required for safetensors checkpoints")
+        model, _, _ = _load_arch_with_weights(arch, path, is_safetensors=True)
+        return model
+
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(loaded, nn.Module):
+        return loaded
+    if not isinstance(loaded, dict):
+        raise ValueError(f"unexpected file content type: {type(loaded)}")
+    if not arch:
+        raise ValueError("--arch is required for state_dict checkpoints")
+
+    sd = loaded
+    pruned_names = None
+    if "model_state_dict" in loaded and isinstance(
+            loaded["model_state_dict"], dict):
+        meta_keys = [k for k in loaded if k != "model_state_dict"]
+        print(f"  Unwrapping checkpoint (other keys: {meta_keys})")
+        sd = loaded["model_state_dict"]
+        # Only thread pruned_layers as force_transpose_names when the saver
+        # converted Conv1D → Linear (Linear-layout on disk). For native
+        # Conv1D-layout saves (SparseGPT unstructured), force-transpose
+        # would corrupt the square attn.c_proj weights.
+        if loaded.get("weights_in_linear_layout", True):
+            pruned_names = loaded.get("pruned_layers")
+
+    model, _, _ = _load_arch_with_weights(
+        arch, path, state_dict=sd, force_transpose_names=pruned_names)
+    return model
+
+
+def run_compare_perplexity(args):
+    """N-way WikiText-2 perplexity comparison across --local checkpoints.
+
+    Loads each path one at a time (so peak memory stays at ~1 model), runs
+    sliding-window perplexity, then prints the comparison table. The first
+    --local entry is treated as the baseline for the Δ columns.
+    """
+    paths = args.local or []
+    if not paths:
+        print("Error: --compare-perplexity requires one or more --local <path>")
+        sys.exit(1)
+
+    arch = _gpt2_arch_name(args.arch) or _gpt2_arch_name(args.model)
+    if arch is None:
+        print("Error: --compare-perplexity currently supports the GPT-2 "
+              "family only. Use --arch gpt2|gpt2-medium|gpt2-large|gpt2-xl.")
+        sys.exit(1)
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"\n{'#'*80}")
+    print(f"#  WIKITEXT-2 PERPLEXITY COMPARE  (n={len(paths)})")
+    print(f"#  arch={arch}  device={device}  "
+          f"max_length={args.ppl_max_length}  stride={args.ppl_stride}")
+    if args.ppl_max_tokens:
+        print(f"#  max_tokens={args.ppl_max_tokens:,} (truncated)")
+    for i, p in enumerate(paths):
+        print(f"#    [{i+1}] {p}")
+    print(f"{'#'*80}")
+
+    from transformers import GPT2Tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained(arch, cache_dir=MODEL_DIR)
+
+    rows = []
+    for i, raw_path in enumerate(paths):
+        path = os.path.abspath(raw_path)
+        label = os.path.basename(path)
+        print(f"\n[{i+1}/{len(paths)}] Loading {label}")
+        if not os.path.isfile(path):
+            print(f"  SKIP — file not found: {path}")
+            continue
+        try:
+            model = _load_local_for_perplexity(path, arch)
+        except Exception as e:
+            print(f"  Error loading {label}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+        notes = f"local: {label}"
+        try:
+            rows.append(evaluate_perplexity(
+                model, tokenizer, label=label, device=device,
+                max_length=args.ppl_max_length, stride=args.ppl_stride,
+                max_tokens=args.ppl_max_tokens, notes=notes,
+            ))
+        except Exception as e:
+            print(f"  Error evaluating {label}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            del model
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     print_perplexity_table(rows)
 
@@ -947,9 +1019,11 @@ def main():
                         choices=["all", "gpt2", "gpt2-medium", "gpt2-large",
                                  "resnet", "vit", "vlm"],
                         help="Which model to profile")
-    parser.add_argument("--local", type=str, default=None,
+    parser.add_argument("--local", type=str, default=None, action="append",
                         help="Path to a local PyTorch model file (.pt/.pth). "
-                             "Overrides --model. Provide --input-shape for non-default input.")
+                             "Overrides --model. Provide --input-shape for non-default input. "
+                             "May be passed multiple times when used with "
+                             "--compare-perplexity to evaluate several checkpoints.")
     parser.add_argument("--input-shape", type=str, default=None,
                         help="Input shape as comma-separated ints (e.g. '1,3,224,224'). "
                              "Used with --local. Defaults to 1,3,224,224.")
@@ -1013,19 +1087,36 @@ def main():
                         help="Override LLM input sequence length. Required when "
                              "loading a torchao-quantized model whose activation "
                              "scales were calibrated at a fixed seq_len.")
-    parser.add_argument("--prune-2-4", action="store_true",
-                        help="Apply 2:4 magnitude pruning to all eligible "
-                             "Linear/Conv1D layers and convert weights to "
-                             "SparseSemiStructuredTensor for cuSPARSELt "
-                             "acceleration on Ampere+ GPUs. Combine with "
-                             "--dynamic-profile to print a before/after table.")
     parser.add_argument("--save-pruned", type=str, nargs="?", const="auto",
                         default=None,
-                        help="Save the 2:4 pruned model. With no argument, "
-                             "writes to <output-dir>/<name>_pruned_2_4.pt. "
+                        help="Save the SparseGPT-pruned model. With no "
+                             "argument, writes to "
+                             "<output-dir>/<name>_sparsegpt_<pattern>.pt. "
                              "Pass an explicit path to override. Sparse-tensor "
-                             "weights are materialized to dense (2:4 zeros "
+                             "weights are materialized to dense (zeros "
                              "preserved) so the file loads portably.")
+    parser.add_argument("--prune", type=str, default=None,
+                        choices=["2:4", "unstructured"],
+                        help="Apply SparseGPT one-shot Hessian-based pruning "
+                             "(Frantar & Alistarh 2023) using a WikiText-2 "
+                             "calibration set. GPT-2 family only. '2:4' "
+                             "yields exact 50%% sparsity in cuSPARSELt-"
+                             "compatible groups (auto-converts to sparse "
+                             "tensor cores on CUDA). 'unstructured' picks "
+                             "lowest-importance weights anywhere; target "
+                             "ratio set by --prune-sparsity. Combine with "
+                             "--save-pruned to persist.")
+    parser.add_argument("--prune-sparsity", type=float, default=0.5,
+                        help="Target sparsity for unstructured pruning "
+                             "(ignored when --prune=2:4). Default: 0.5.")
+    parser.add_argument("--prune-samples", type=int, default=128,
+                        help="Number of WikiText-2 calibration sequences "
+                             "(default 128 — paper recipe). Lower for "
+                             "faster iteration; 32 is usually enough for "
+                             "a sanity-check run.")
+    parser.add_argument("--prune-seqlen", type=int, default=1024,
+                        help="Calibration sequence length (default 1024 = "
+                             "GPT-2 max ctx).")
     parser.add_argument("--perplexity", action="store_true",
                         help="Evaluate WikiText-2 perplexity on the loaded model "
                              "(GPT-2 family only). Combine with --model gpt2 or "
@@ -1035,6 +1126,12 @@ def main():
                              "base GPT-2, plan-quantized checkpoint (see "
                              "--quantized-checkpoint), and that checkpoint with "
                              "2:4 magnitude pruning applied. Prints a table.")
+    parser.add_argument("--compare-perplexity", action="store_true",
+                        help="N-way WikiText-2 perplexity comparison across "
+                             "multiple --local checkpoints. Pass --local "
+                             "<path> once per model and a shared --arch. "
+                             "Example: --compare-perplexity --local a.pt "
+                             "--local b.pt --arch gpt2 --device cuda")
     parser.add_argument("--quantized-checkpoint", type=str,
                         default="./gpt_2_plan_quantized.pt",
                         help="Path to a plan-quantized .pt produced by "
@@ -1067,12 +1164,21 @@ def main():
         run_perplexity_compare(args)
         return
 
+    # N-way perplexity compare across multiple --local checkpoints.
+    if args.compare_perplexity:
+        run_compare_perplexity(args)
+        return
+
     # Initialize profiler
     static_profiler = StaticProfiler()
 
     # ── Local model path ──
     if args.local:
-        local_path = os.path.abspath(args.local)
+        if len(args.local) > 1:
+            print("Note: multiple --local paths given; using the first one for "
+                  "the standard pipeline. Pass --compare-perplexity to evaluate "
+                  "all of them.")
+        local_path = os.path.abspath(args.local[0])
         if not os.path.isfile(local_path):
             print(f"Error: local model file not found: {local_path}")
             sys.exit(1)
@@ -1149,8 +1255,11 @@ def main():
                     sd = loaded["model_state_dict"]
                     # Pruned-2:4 checkpoints went through a Conv1D→Linear
                     # transpose; thread the layer list to disambiguate
-                    # square Conv1D modules during layout restoration.
-                    pruned_names = loaded.get("pruned_layers")
+                    # square Conv1D modules during layout restoration. Skip
+                    # this for SparseGPT-unstructured saves where weights
+                    # stay in native Conv1D layout (no transpose needed).
+                    if loaded.get("weights_in_linear_layout", True):
+                        pruned_names = loaded.get("pruned_layers")
                 local_model, forward_fn, arch_sample = _load_arch_with_weights(
                     args.arch, local_path, state_dict=sd,
                     force_transpose_names=pruned_names)
@@ -1223,11 +1332,21 @@ def main():
                 output_dir=args.output_dir,
             )
 
-        # Dynamic profiling (+ optional 2:4 pruning before/after compare)
+        # SparseGPT pruning runs before dynamic profile / perplexity so the
+        # downstream evaluation operates on the pruned model.
+        if args.prune is not None:
+            run_prune(
+                local_model, local_name, args, args.output_dir,
+            )
+
         if args.dynamic_profile:
-            _profile_and_optionally_prune(
-                local_model, sample_input, local_name, forward_fn,
-                args, args.output_dir,
+            device = args.device or (
+                "cuda" if torch.cuda.is_available() else "cpu")
+            run_dynamic_profile(
+                local_model, sample_input, model_name=local_name,
+                forward_fn=forward_fn, device=device,
+                num_runs=args.profile_runs, save_trace=args.save_trace,
+                output_dir=args.output_dir,
             )
 
         if args.perplexity:
@@ -1335,11 +1454,19 @@ def main():
                     output_dir=args.output_dir,
                 )
 
-            # Dynamic profiling (+ optional 2:4 pruning before/after compare)
+            # SparseGPT pruning runs before dynamic profile / perplexity so
+            # the downstream evaluation operates on the pruned model.
+            if args.prune is not None:
+                run_prune(model, name, args, args.output_dir)
+
             if args.dynamic_profile:
-                _profile_and_optionally_prune(
-                    model, sample_input, name, forward_fn,
-                    args, args.output_dir,
+                device = args.device or (
+                    "cuda" if torch.cuda.is_available() else "cpu")
+                run_dynamic_profile(
+                    model, sample_input, model_name=name,
+                    forward_fn=forward_fn, device=device,
+                    num_runs=args.profile_runs, save_trace=args.save_trace,
+                    output_dir=args.output_dir,
                 )
 
             if args.perplexity:
