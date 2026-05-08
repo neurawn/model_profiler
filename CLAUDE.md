@@ -40,10 +40,10 @@ python main.py --model gpt2 --quantize smoothquant
 python main.py --model gpt2 --quantize float16
 
 # ── Token Merging (ViT/VLM only) ──
-python main.py --model vit --token-merging                    # Analyze strategies
-python main.py --model vit --apply-tome                       # Apply and save model
-python main.py --model vit --apply-tome --merge-ratio 0.7     # Custom ratio
-python main.py --model vlm --apply-tome --merge-strategy kmeans
+python main.py --model vit --apply-tome                                        # Analyze + apply
+python main.py --model vit --apply-tome --save-merged                          # Analyze + apply + save
+python main.py --model vit --apply-tome --merge-ratio 0.7 --save-merged        # Custom ratio
+python main.py --model vlm --apply-tome --merge-strategy kmeans --save-merged
 
 # ── Dynamic Profiling (torch.profiler) ──
 python main.py --model gpt2 --dynamic-profile                 # CPU profiling

@@ -296,9 +296,7 @@ def profile_single_model(model_name, model, sample_input, forward_fn,
 
 
 def analyze_token_merging(model, sample_input, forward_fn, model_name,
-                          ratios=None,
-                          save_merged=False, save_strategy="bipartite",
-                          save_ratio=0.5, output_dir="./profiling_results"):
+                          ratios=None):
     """
     Run token merging analysis on a ViT model and estimate theoretical speedup.
 
@@ -379,42 +377,6 @@ def analyze_token_merging(model, sample_input, forward_fn, model_name,
             print(f"    Overall speedup:   {overall_speedup:.2f}x")
 
         results[ratio] = profile
-
-    # ── 4. Save merged model if requested ──
-    if save_merged:
-        print(f"\n{'─'*60}")
-        print(f"  SAVING MERGED MODEL (ratio={save_ratio}, {save_strategy})")
-        print(f"{'─'*60}")
-        try:
-            merged_model = apply_token_merging(
-                model, strategy=save_strategy, ratio=save_ratio,
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
-            save_path = os.path.join(
-                output_dir,
-                f"{safe_name}_tome_{save_strategy}_r{save_ratio}.pt",
-            )
-            # Remove hooks before saving (closures can't be pickled)
-            merged_model.remove_hooks()
-            # Save the base model state dict + merging config
-            save_data = {
-                "model_state_dict": merged_model.model.state_dict(),
-                "model_class": type(merged_model.model).__name__,
-                "merge_config": {
-                    "strategy": save_strategy,
-                    "ratio": save_ratio,
-                    "protect_cls": merged_model.protect_cls,
-                    "merge_layers": merged_model.merge_layers,
-                },
-            }
-            torch.save(save_data, save_path)
-            print(f"    Saved merged model: {save_path}")
-            print(f"    Load with: data = torch.load('{save_path}')")
-            print(f"    Then:      model.load_state_dict(data['model_state_dict'])")
-            print(f"               wrapped = apply_token_merging(model, **data['merge_config'])")
-        except Exception as e:
-            print(f"    Could not save merged model: {e}")
 
     print(f"\n{'#'*70}\n")
     return results
@@ -1036,20 +998,19 @@ def main():
                         help="Target deployment device for recommendations")
     parser.add_argument("--output-dir", type=str, default="./profiling_results",
                         help="Directory to save JSON results")
-    parser.add_argument("--token-merging", action="store_true",
-                        help="Run token merging analysis on ViT/VLM models with "
-                             "theoretical speedup estimation")
     parser.add_argument("--merge-ratios", type=str, default="0.3,0.5,0.7,0.9",
                         help="Comma-separated keep ratios for token merging "
-                             "(e.g. '0.3,0.5,0.7')")
+                             "analysis (e.g. '0.3,0.5,0.7')")
     parser.add_argument("--merge-strategy", type=str, default="bipartite",
                         choices=["bipartite", "kmeans", "average_pool"],
                         help="Strategy to use for token merging")
     parser.add_argument("--merge-ratio", type=float, default=0.5,
                         help="Keep ratio for token merging (default: 0.5)")
     parser.add_argument("--apply-tome", action="store_true",
-                        help="Apply token merging to ViT/VLM model after profiling "
-                             "and save the merged model locally")
+                        help="Run token merging analysis and apply merging to "
+                             "ViT/VLM models")
+    parser.add_argument("--save-merged", action="store_true",
+                        help="Save the token-merged model to the output directory")
     parser.add_argument("--quantize", type=str, default=None,
                         choices=["dynamic", "static", "float16",
                                  "weight_int8", "weight_int4", "smoothquant"],
@@ -1324,13 +1285,19 @@ def main():
                 forward_fn=forward_fn, save_path=save_path,
             )
 
-        # Apply token merging and save
+        # Token merging: analyze + apply (+ save if --save-merged)
         if args.apply_tome:
-            apply_and_save_tome(
-                local_model, local_name, forward_fn, sample_input,
-                strategy=args.merge_strategy, ratio=args.merge_ratio,
-                output_dir=args.output_dir,
+            merge_ratios = [float(r) for r in args.merge_ratios.split(",")]
+            analyze_token_merging(
+                local_model, sample_input, forward_fn, local_name,
+                ratios=merge_ratios,
             )
+            if args.save_merged:
+                apply_and_save_tome(
+                    local_model, local_name, forward_fn, sample_input,
+                    strategy=args.merge_strategy, ratio=args.merge_ratio,
+                    output_dir=args.output_dir,
+                )
 
         # SparseGPT pruning runs before dynamic profile / perplexity so the
         # downstream evaluation operates on the pruned model.
@@ -1431,28 +1398,22 @@ def main():
                     forward_fn=forward_fn, save_path=save_path,
                 )
 
-            # Token merging analysis for ViT/VLM models
+            # Token merging: analyze + apply (+ save if --save-merged)
             is_vision = any(k in key.lower() for k in ["vit", "vlm", "clip"])
-            if args.token_merging and is_vision:
+            if args.apply_tome and is_vision:
                 merge_ratios = [float(r) for r in args.merge_ratios.split(",")]
                 tm_results = analyze_token_merging(
                     model, sample_input, forward_fn, name,
                     ratios=merge_ratios,
-                    save_merged=False,
-                    save_strategy=args.merge_strategy,
-                    save_ratio=args.merge_ratio,
-                    output_dir=args.output_dir,
                 )
                 if tm_results:
                     all_results[name]["token_merging"] = tm_results
-
-            # Apply token merging and save model
-            if args.apply_tome and is_vision:
-                apply_and_save_tome(
-                    model, name, forward_fn, sample_input,
-                    strategy=args.merge_strategy, ratio=args.merge_ratio,
-                    output_dir=args.output_dir,
-                )
+                if args.save_merged:
+                    apply_and_save_tome(
+                        model, name, forward_fn, sample_input,
+                        strategy=args.merge_strategy, ratio=args.merge_ratio,
+                        output_dir=args.output_dir,
+                    )
 
             # SparseGPT pruning runs before dynamic profile / perplexity so
             # the downstream evaluation operates on the pruned model.
