@@ -348,35 +348,56 @@ def analyze_token_merging(model, sample_input, forward_fn, model_name,
     B, T, D = token_tensor.shape
     print(f"\n  Token sequence: B={B}, T={T}, D={D}")
 
-    # ── 2. Compare strategies at each ratio ──
+    # ── 2. Compare strategies at each ratio, collect rows ──
     results = {}
-    for ratio in ratios:
-        print(f"\n{'─'*60}")
-        print(f"  Keep ratio = {ratio:.0%} (merge {1 - ratio:.0%} of tokens)")
-        print(f"{'─'*60}")
+    rows = []
 
+    for ratio in ratios:
         profile = compare_strategies(
             token_tensor, ratio=ratio,
             model_name=f"{model_name} (ratio={ratio})",
-            verbose=True,
+            verbose=False,
         )
 
-        # ── 3. Theoretical speedup estimation ──
         for strategy_name, merge_result in profile.results.items():
             T_new = merge_result.merged_count
-            r = T_new / T  # reduction ratio
+            r = T_new / T
+            reduction_pct = (1 - r) * 100
 
-            attn_speedup = 1.0 / (r ** 2) if r > 0 else 1.0
-            ffn_speedup = 1.0 / r if r > 0 else 1.0
-            overall_speedup = 1.0 / (0.4 * r**2 + 0.6 * r) if r > 0 else 1.0
+            attn_spd = 1.0 / (r ** 2) if r > 0 else 1.0
+            ffn_spd = 1.0 / r if r > 0 else 1.0
+            overall_spd = 1.0 / (0.4 * r**2 + 0.6 * r) if r > 0 else 1.0
 
-            print(f"\n  [{strategy_name.upper()}] Theoretical Speedup:")
-            print(f"    Tokens:           {T} -> {T_new}")
-            print(f"    Attention speedup: {attn_speedup:.2f}x  (O(T^2) reduction)")
-            print(f"    FFN speedup:       {ffn_speedup:.2f}x  (O(T) reduction)")
-            print(f"    Overall speedup:   {overall_speedup:.2f}x")
+            rows.append((strategy_name, ratio, T, T_new, reduction_pct,
+                         merge_result.time_ms, attn_spd, ffn_spd, overall_spd))
 
         results[ratio] = profile
+
+    # ── 3. Print consolidated table ──
+    hdr = (f"  {'Strategy':<14}{'Ratio':>6}  {'Tokens':<13}{'Reduction':>9}"
+           f"  {'Time(ms)':>9}  {'Attn Spd':>8}  {'FFN Spd':>8}  {'Overall':>8}")
+    sep = f"  {'─'*12}  {'─'*6}  {'─'*11}  {'─'*9}  {'─'*9}  {'─'*8}  {'─'*8}  {'─'*8}"
+    print(f"\n{hdr}")
+    print(sep)
+
+    best_row = None
+    prev_strategy = None
+    for row in sorted(rows, key=lambda r: (r[0], r[1])):
+        strategy, ratio, t_orig, t_new, red_pct, time_ms, attn, ffn, overall = row
+        if prev_strategy is not None and strategy != prev_strategy:
+            print(sep)
+        prev_strategy = strategy
+
+        tokens_str = f"{t_orig} -> {t_new}"
+        print(f"  {strategy:<14}{ratio:>5.0%}   {tokens_str:<13}{red_pct:>8.1f}%"
+              f"  {time_ms:>9.2f}  {attn:>7.2f}x  {ffn:>7.2f}x  {overall:>7.2f}x")
+
+        if best_row is None or overall > best_row[-1]:
+            best_row = row
+
+    if best_row:
+        print(f"\n  Best: {best_row[0]} @ {best_row[1]:.0%} keep ratio"
+              f" (overall speedup: {best_row[-1]:.2f}x)")
 
     print(f"\n{'#'*70}\n")
     return results
@@ -979,7 +1000,7 @@ def main():
     )
     parser.add_argument("--model", type=str, default="all",
                         choices=["all", "gpt2", "gpt2-medium", "gpt2-large",
-                                 "resnet", "vit", "vlm"],
+                                 "resnet", "vit", "vit-large", "vlm"],
                         help="Which model to profile")
     parser.add_argument("--local", type=str, default=None, action="append",
                         help="Path to a local PyTorch model file (.pt/.pth). "
@@ -1335,6 +1356,7 @@ def main():
         "gpt2-large": ("GPT-2-Large", lambda: load_gpt2("gpt2-large")),
         "resnet": ("ResNet-18", load_resnet18),
         "vit": ("ViT-Base", load_vit),
+        "vit-large": ("ViT-Large", lambda: load_vit("google/vit-large-patch16-224")),
         "vlm": ("CLIP-ViT-Base", load_vlm),
     }
 
