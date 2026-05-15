@@ -275,6 +275,61 @@ def apply_and_save_tome(model, model_name, forward_fn, sample_input,
         return None
 
 
+def save_all_tome_models(model, model_name, forward_fn, sample_input,
+                         ratios, strategies=("bipartite", "kmeans", "average_pool"),
+                         output_dir="./all_token_merging_models"):
+    """Save token-merged models for every strategy × ratio combination."""
+    os.makedirs(output_dir, exist_ok=True)
+    safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
+
+    print(f"\n{'#'*70}")
+    print(f"#  SAVING ALL TOKEN MERGING MODELS: {model_name}")
+    print(f"#  Strategies: {', '.join(strategies)}")
+    print(f"#  Ratios:     {', '.join(f'{r:.0%}' for r in ratios)}")
+    print(f"#  Output dir: {output_dir}")
+    print(f"{'#'*70}")
+
+    saved = []
+    for strategy in strategies:
+        for ratio in ratios:
+            label = f"{strategy} r={ratio:.0%}"
+            try:
+                merged_model = apply_token_merging(
+                    model, strategy=strategy, ratio=ratio,
+                )
+                merged_model.eval()
+                fwd = forward_fn if forward_fn else lambda m, x: m(x)
+                with torch.no_grad():
+                    fwd(merged_model, sample_input)
+
+                merged_model.remove_hooks()
+
+                save_path = os.path.join(
+                    output_dir,
+                    f"{safe_name}_tome_{strategy}_r{ratio}.pt",
+                )
+                save_data = {
+                    "model_state_dict": merged_model.model.state_dict(),
+                    "model_class": type(merged_model.model).__name__,
+                    "merge_config": {
+                        "strategy": strategy,
+                        "ratio": ratio,
+                        "protect_cls": merged_model.protect_cls,
+                        "merge_layers": merged_model.merge_layers,
+                    },
+                }
+                torch.save(save_data, save_path)
+                size_mb = os.path.getsize(save_path) / (1024 * 1024)
+                print(f"  Saved: {save_path} ({size_mb:.1f} MB)")
+                saved.append(save_path)
+            except Exception as e:
+                print(f"  FAILED [{label}]: {e}")
+
+    print(f"\n  Total: {len(saved)} models saved to {output_dir}")
+    print(f"{'#'*70}\n")
+    return saved
+
+
 def profile_single_model(model_name, model, sample_input, forward_fn,
                           static_profiler, target_device="gpu"):
     """Run static profiling pipeline on a single model."""
@@ -1032,6 +1087,16 @@ def main():
                              "ViT/VLM models")
     parser.add_argument("--save-merged", action="store_true",
                         help="Save the token-merged model to the output directory")
+    parser.add_argument("--save-all-merged", action="store_true",
+                        help="Save all strategy×ratio token-merged models to "
+                             "all_token_merging_models/")
+    parser.add_argument("--tome-benchmark", action="store_true",
+                        help="Run ImageNet accuracy/throughput/latency benchmark on "
+                             "all saved token-merged models in all_token_merging_models/")
+    parser.add_argument("--imagenet-dir", type=str, default=None,
+                        help="Path to ImageNet validation set for --tome-benchmark")
+    parser.add_argument("--benchmark-samples", type=int, default=0,
+                        help="Number of ImageNet samples for --tome-benchmark (0=all)")
     parser.add_argument("--quantize", type=str, default=None,
                         choices=["dynamic", "static", "float16",
                                  "weight_int8", "weight_int4", "smoothquant"],
@@ -1140,6 +1205,19 @@ def main():
         args.graph = True
 
     ctx_lens = [int(x) for x in args.context_lengths.split(",")]
+
+    # Standalone ToMe benchmark: evaluates all saved models on ImageNet.
+    if args.tome_benchmark:
+        from tome_benchmark import run_benchmark as _run_tome_benchmark
+        _bench_args = argparse.Namespace(
+            models_dir="./all_token_merging_models",
+            imagenet_dir=args.imagenet_dir,
+            num_samples=args.benchmark_samples,
+            device=args.device or ("cuda" if torch.cuda.is_available() else "cpu"),
+            output="./profiling_results/tome_benchmark.csv",
+        )
+        _run_tome_benchmark(_bench_args)
+        return
 
     # Standalone perplexity comparison: handles all model loading itself.
     if args.perplexity_compare:
@@ -1319,6 +1397,11 @@ def main():
                     strategy=args.merge_strategy, ratio=args.merge_ratio,
                     output_dir=args.output_dir,
                 )
+            if args.save_all_merged:
+                save_all_tome_models(
+                    local_model, local_name, forward_fn, sample_input,
+                    ratios=merge_ratios,
+                )
 
         # SparseGPT pruning runs before dynamic profile / perplexity so the
         # downstream evaluation operates on the pruned model.
@@ -1435,6 +1518,11 @@ def main():
                         model, name, forward_fn, sample_input,
                         strategy=args.merge_strategy, ratio=args.merge_ratio,
                         output_dir=args.output_dir,
+                    )
+                if args.save_all_merged:
+                    save_all_tome_models(
+                        model, name, forward_fn, sample_input,
+                        ratios=merge_ratios,
                     )
 
             # SparseGPT pruning runs before dynamic profile / perplexity so
